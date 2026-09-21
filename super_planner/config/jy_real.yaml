@@ -1,0 +1,228 @@
+fsm:
+  click_goal_en: true  #使用click_goal_topic
+  click_goal_topic: "/goal" #目标话题
+  click_height: 1.5  #目标高度（rviz点击）
+  click_yaw_en: true
+  replan_rate: 10.0  # replanTimerCallback 重规划频率（改为10Hz以减少CPU）
+  cmd_topic: "/planning/pos_cmd"
+  mpc_cmd_topic: "/planning_cmd/poly_traj"
+  timer_en: true #创建三个定时器：，mainFsmTimerCallback  pubCmdTimerCallback  replanTimerCallback
+  
+  
+
+super_planner:
+  backup_traj_en: false    #开启备份轨迹  #nouse
+  detailed_log_en: false  #详细log
+  visualization_en: false #//开启可视化（改为false以降低CPU负担）
+  use_fov_cut: true  #裁减fov？（改为true以加速处理）
+  print_log: false  #//打印log
+  visual_process: false  #//可视化处理
+  frontend_in_known_free: false  #前端在未知边界内？
+  goal_yaw_en: true   #//目标yaw开启
+  goal_vel_en: false  #//目标速度开启
+  corridor_bound_dis: 1.0  #//走廊边界长度（初始化正方体）
+  corridor_line_max_length: 1.0   #//走廊线最大长度（改大以减少重规划）
+  safe_corridor_line_max_length: 3.0 #//安全走廊线最大长度（改大）
+  iris_iter_num: 1  #//iris迭代次数（改为1以加速）
+  obs_skip_num: 1  #障碍物躲避数量（改为1以加速）
+  replan_forward_dt: 0.3  #重规划向前时间（改大以减少频繁重规划）
+  planning_horizon: 8.0  #规划界限（改大）
+  sensing_horizon: -1  #感知界限
+  receding_dis: 3.0 #//后退距离（改大）
+  robot_r: 0.15  #机器人半径（改大以更保守）
+  yaw_dot_max: 0.8 #//最大yaw角速度（改大）
+  # Yaw mode: 1 heading to velocity, 2 heading to goal
+  yaw_mode: 1
+  mpc_horizon: 15 #mpc步数
+
+
+traj_opt:  #轨迹优化参数
+  switch:
+    save_log_en: false  #// 保存日志
+    print_optimizer_log: false #//print优化器日志
+
+  boundary:   #///边界参数
+    max_vel: 1.0
+    max_acc: 0.8
+    max_jerk: 20.0
+    max_omg: 1.0
+    max_acc_thr: 2.0
+    min_acc_thr: 0.1
+    penna_margin: 0.05
+
+  exp_traj:
+    # 1 for xi 2 for pos
+    pos_constraint_type: 1  #//位置约束类型
+    energy_cost_type: 4
+    block_energy_cost: false
+    opt_accuracy: 5.0e-6  #//相对优化终止容差。
+    scale_factor: 1.0
+    integral_reso: 15
+    smooth_eps: 0.01
+    local_density_en: true
+    local_density_radius_x: 0.75
+    local_density_radius_y: 0.75
+    local_density_radius_z: 0.5
+    local_density_smooth_eps: 0.08
+    local_density_time_inflation: 0.1
+    local_density_weight: 1.0e+5
+    penna_t: 1200.0
+    penna_pos: 5.0e+5
+    penna_vel: 5.0e+4
+    penna_acc: 5.0e+4
+    penna_jerk: -5.0e+4
+    penna_attract: 5.0e+3
+    penna_omg:  5.0e+5
+    penna_max_acc_thr:  5.0e+4
+    penna_min_acc_thr:  5.0e+4
+
+  backup_traj:
+    pos_constraint_type: 1
+    piece_num: 2
+    energy_cost_type: 4
+    block_energy_cost: true
+    opt_accuracy: 1.0e-6
+    scale_factor: 1.0
+    integral_reso: 12
+    smooth_eps: 0.01
+    local_density_en: true
+    local_density_radius_x: 0.5
+    local_density_radius_y: 0.5
+    local_density_radius_z: 0.35
+    local_density_smooth_eps: 0.08
+    local_density_time_inflation: 0.1
+    local_density_weight: 1.0e+2
+    trigger_density_weight: 5.0e+4
+    trigger_static_clearance: 0.8
+    trigger_static_weight: 1.0
+    trigger_swarm_weight: 1.0
+    penna_t: 1200.0
+    penna_ts: 1.0e+5
+    penna_pos: 1.0e+6
+    penna_vel: 1.0e+5
+    penna_acc: 1.0e+5
+    penna_jerk: -1.0e+5
+    penna_omg: 1.0e+5
+    penna_max_acc_thr: 1.0e+5
+    penna_min_acc_thr: 1.0e+5
+
+  flatness:   #//平滑化参数
+    mass: 1.64
+    dh: 0.35
+    dv: 0.35
+    cp: 0.001
+    v_eps: 0.0001
+    grav: 9.81
+
+
+astar:
+  map_voxel_num: [ 500, 500, 100 ]  #地图体素数量
+  visual_process: false  #可视化
+  allow_diag: true  #允许对角线搜索路径
+  # 0 DIAG; 1 MANHATTAN; 2 EUCLIDEAN
+  heu_type: 2   #//启发式函数种类
+  debug_visualization_en: false  #//开启debug可视化
+
+
+rog_map:
+  resolution: 0.1 #分辨率（改为0.1以加速处理，从0.05）
+  inflation_resolution: 0.1 #//膨胀地图分辨率
+  inflation_step: 2  #膨胀步数
+  unk_inflation_en: false #未知膨胀
+  unk_inflation_step: 1  #未知膨胀步数
+  map_size: [ 15, 15, 4 ] #地图大小（改小以加速）
+  # If the map rolling is disable, the map origin [m] should be set.
+  fix_map_origin: [ 0,0,1.5 ]  #固定地图中心（全局中心）
+  frontier_extraction_en: false  ##//边界提取
+
+  # Virtual ceil and ground
+  virtual_ceil_height: 2.5  #虚拟天花板
+  # ROG-Map adds 0.15 m here for 0.1 m resolution/inflation_step=1.
+  # Swarm-LIO starts near local z=0, so -0.3 keeps initialization and
+  # takeoff point-cloud updates inside the valid map volume.
+  virtual_ground_height: -0.3 #虚拟地面
+
+  load_pcd_en: false #加载点云
+
+  map_sliding: #滑动更新
+    enable: true # 允许滑动更新
+    # The minimum distance [m] to slide the map.
+    threshold: 0.5  ## 滑动更新阈值（改大以减少更新频率）
+
+  esdf: #欧式距离场
+    enable: false #开启？
+    resolution: 0.1 #分辨率
+    # The range of esdf around the odom [m].
+    local_update_box: [ 20,20,5 ] #local附近esdf范围
+
+  # If [enable = true], the ROG-Map will actively take ros topic as input.
+  #  else user should call function [updateMap] to update the map.
+  ros_callback: #回调函数
+    enable: true #开启回调  odom cloud timer_update
+    cloud_topic: "/cloud_registered" #点云输入（通过launch remap到/uav_name/cloud_registered）
+    # cloud_f_topic: "/nnnn"
+    # Use the same Swarm-LIO frame as cloud_registered. The dual-UAV launch
+    # remaps this to /uav1/Odometry and /uav2/Odometry respectively.
+    odom_topic: "/Odometry"
+
+    
+    # depth_topic: "/camera/aligned_depth_to_color/image_raw"
+    # depth_topic: "/camera/depth/image_rect_raw"
+    
+
+    odom_timeout: 2.0  #位姿超时阈值
+
+
+  visualization: #可视化
+    enable: true
+    # when enabled, use rqt_reconfigure to change the visualization parameters.
+    use_dynamic_reconfigure: false
+    # The rate of visualization [Hz], if set to 0, the visualization will not be triggered by frame.
+    time_rate: 2
+    # The frame rate of visualization [Hz], if set to 0, the visualization will not be triggered by frame.
+    frame_rate: 0
+    # visualization range along the odom [m].
+    range: [ 20, 20,5 ]
+    frame_id: "world"
+    pub_unknown_map_en: false
+
+  # Intensity filter for input point cloud. If the point intensity is less than this value,
+  # it will be ignored (to avoid noise like dusk).
+  intensity_thresh: -10  #反射率阈值（滤掉）
+  # The temporal downsample rate for input point cloud.
+  #  e.g. if set to k, the point cloud will be downsampled to 1/k.
+  point_filt_num: 1
+
+  # Probabilistc update
+  raycasting:
+    # if disable, the map will only maintain occupied information, and all other grid
+    # will be considered as unknown.
+    enable: true
+    batch_update_size: 1
+    local_update_box: [ 50,50,10 ]
+    # The range of raycasting [m].
+    ray_range: [0.5, 999 ]
+
+    p_min: 0.12
+    p_miss: 0.45
+    p_free: 0.499
+    p_occ: 0.85
+    p_hit: 0.9
+    p_max: 0.98
+    # The threshold of a non-occupied inf map grid to be considered as free. [0.0-1.0]
+    # for counter map, if each cell contains N cells in prob map, then only when
+    # N_unk > N * unk_thresh cells are unknown, the cell will be considered as unknown.
+    # example: 1) if unk_thresh is set 0.0, then once at least one cell in prob map is unknown,
+    #             the cell will be considered as unknown.
+    #         2) if unk_thresh is set to 1.0, then only all cells in prob map are unknown,
+    #             the cell will be considered as unknown.
+    # in all, 1.0 is more aggressive while 0.0 is more conservative.
+    unk_thresh: 1.0
+    # 被视为空闲的未占用的 inf 地图网格的阈值。[0.0-1.0]
+    # 对于计数器映射，如果每个单元格在概率地图中包含 N 个单元格，则仅当
+    # N_unk > N * unk_thresh 个单元格未知，则该单元格将被视为未知。
+    # 示例：1） 如果 unk_thresh 设置为 0.0，则一旦 prob map 中至少有一个单元格是未知的，
+    # 该单元格将被视为 unknown。
+    # 2） 如果 unk_thresh 设置为 1.0，则只有 prob map 中的所有单元格都是未知的，
+    # 该单元格将被视为 unknown。
+    # 总而言之，1.0 更激进，而 0.0 更保守。

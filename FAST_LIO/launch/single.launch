@@ -1,0 +1,7 @@
+<launch>
+    <arg name="uav_name" default="uav1" />
+    <include file="$(find fast_lio)/launch/mapping_mid360.launch">
+        <arg name="uav_name" value="$(arg uav_name)" />
+        <arg name="rviz" value="false" />
+    </include>
+</launch>

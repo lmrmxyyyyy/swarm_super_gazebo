@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<launch>
+    <!-- Dual MAVROS configuration for PX4 -->
+    <!-- This launch file starts MAVROS for both UAV1 and UAV2 -->
+    
+    <!-- UAV1 MAVROS configuration -->
+    <include file="$(find mavros)/launch/px4.launch" ns="uav1">
+        <arg name="fcu_url" default="udp://:24540@localhost:34580" />
+        <arg name="gcs_url" default="" />
+        <arg name="tgt_system" default="1" />
+        <arg name="tgt_component" default="1" />
+    </include>
+    
+    <!-- UAV2 MAVROS configuration -->
+    <include file="$(find mavros)/launch/px4.launch" ns="uav2">
+        <arg name="fcu_url" default="udp://:24541@localhost:34581" />
+        <arg name="gcs_url" default="" />
+        <arg name="tgt_system" default="2" />
+        <arg name="tgt_component" default="1" />
+    </include>
+    
+</launch>

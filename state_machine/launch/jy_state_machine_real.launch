@@ -1,0 +1,13 @@
+<launch>
+   <arg name="initial_x" default="0.0" />
+   <arg name="initial_y" default="0.0" />
+   <arg name="initial_z" default="0.0" />
+   
+   <node pkg="state_machine" type="jy_state_machine.py" name="jy_state_machine" output="screen">
+     <rosparam file="$(find state_machine)/config/jy_path.yaml" command="load" />
+     <param name="real_fly"  value="true" />
+     <param name="initial_x" value="$(arg initial_x)" />
+     <param name="initial_y" value="$(arg initial_y)" />
+     <param name="initial_z" value="$(arg initial_z)" />
+   </node>
+</launch>

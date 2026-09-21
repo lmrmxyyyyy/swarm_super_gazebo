@@ -1,0 +1,29 @@
+{
+  "configurations": [
+    {
+      "browse": {
+        "databaseFilename": "${default}",
+        "limitSymbolsToIncludedHeaders": false
+      },
+      "includePath": [
+        "/home/fractal/catkin_ws/devel/include/**",
+        "/home/fractal/livox_ros_driver2/devel/include/**",
+        "/opt/ros/noetic/include/**",
+        "/home/fractal/catkin_ws/src/FAST_LIO/include/**",
+        "/home/fractal/catkin_ws/src/fast_lio_sam_std/include/**",
+        "/home/fractal/catkin_ws/src/faster-lio/include/**",
+        "/home/fractal/livox_ws/src/livox_laser_simulation/include/**",
+        "/home/fractal/catkin_ws/src/Point-LIO/include/**",
+        "/home/fractal/catkin_ws/src/STD/include/**",
+        "/home/fractal/catkin_ws/src/to_cp/include/**",
+        "/usr/include/**"
+      ],
+      "name": "ROS",
+      "intelliSenseMode": "gcc-x64",
+      "compilerPath": "/usr/bin/gcc",
+      "cStandard": "gnu11",
+      "cppStandard": "c++14"
+    }
+  ],
+  "version": 4
+}

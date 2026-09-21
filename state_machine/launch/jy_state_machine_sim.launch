@@ -1,0 +1,31 @@
+<launch>
+   <arg name="uav_name" default="uav1" />
+   <arg name="initial_x" default="0.0" />
+   <arg name="initial_y" default="0.0" />
+   <arg name="initial_z" default="0.0" />
+   
+   <node pkg="state_machine" type="jy_state_machine.py" name="jy_state_machine_$(arg uav_name)" output="screen" ns="$(arg uav_name)">
+     <rosparam file="$(find state_machine)/config/jy_path.yaml" command="load" />
+     <param name="real_fly"  value="false" />
+     <param name="uav_name" value="$(arg uav_name)" />
+     <param name="initial_x" value="$(arg initial_x)" />
+     <param name="initial_y" value="$(arg initial_y)" />
+     <param name="initial_z" value="$(arg initial_z)" />
+     
+     <!-- Topic remappings -->
+     <remap from="~mavros/state" to="/$(arg uav_name)/mavros/state" />
+     <remap from="~drone_odometry" to="/$(arg uav_name)/drone_odometry" />
+     <remap from="~cloud_registered" to="/$(arg uav_name)/cloud_registered" />
+     <remap from="~goal" to="/$(arg uav_name)/goal" />
+     <remap from="~state_machine" to="/$(arg uav_name)/state_machine" />
+     <remap from="~mpc_trajectory" to="/$(arg uav_name)/mpc_trajectory" />
+     <remap from="~stop_super" to="/$(arg uav_name)/stop_super" />
+     <remap from="~filtered_static_pcd" to="/$(arg uav_name)/filtered_static_pcd" />
+     <remap from="~filtered_dynamic_pcd" to="/$(arg uav_name)/filtered_dynamic_pcd" />
+     <remap from="~mavros/cmd/arming" to="/$(arg uav_name)/mavros/cmd/arming" />
+     <remap from="~mavros/set_mode" to="/$(arg uav_name)/mavros/set_mode" />
+   </node>
+   
+   <!-- control_move.py 仅在启动第一个无人机时启动（Gazebo中的动态物体是全局的）-->
+   <node if="$(eval uav_name == 'uav1')" pkg="state_machine" type="control_move.py" name="control_move" output="screen" />
+</launch>

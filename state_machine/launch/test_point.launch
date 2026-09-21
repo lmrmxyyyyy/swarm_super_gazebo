@@ -1,0 +1,5 @@
+<launch>
+    <node pkg="state_machine" type="test_point.py" name="dual_uav_state_machine" output="screen">
+        <rosparam file="$(find state_machine)/config/test_point.yaml" command="load" />
+    </node>
+</launch>

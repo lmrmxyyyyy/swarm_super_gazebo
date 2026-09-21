@@ -1,0 +1,15 @@
+<launch>
+<!-- Launch file for Livox AVIA LiDAR -->
+
+	<arg name="rviz" default="true" />
+
+
+    <node pkg="point_lio" type="global_localization.py" name="global_localization" output="screen" />
+
+	
+
+	<group if="$(arg rviz)">
+	<node launch-prefix="nice" pkg="rviz" type="rviz" name="rviz_localization" args="-d $(find point_lio)/rviz_cfg/localization.rviz" />
+	</group>
+
+</launch>

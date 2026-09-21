@@ -1,0 +1,25 @@
+<launch>
+    <group ns="uav1">
+        <node pkg="state_machine" type="test_point.py" name="test_point" output="screen">
+            <rosparam file="$(find state_machine)/config/test_point.yaml" command="load" />
+            <remap from="~mavros/state" to="/uav1/mavros/state" />
+            <remap from="~drone_odometry" to="/uav1/drone_odometry" />
+            <remap from="~goal" to="/uav1/goal" />
+            <remap from="~state_machine" to="/uav1/state_machine" />
+            <remap from="~mavros/cmd/arming" to="/uav1/mavros/cmd/arming" />
+            <remap from="~mavros/set_mode" to="/uav1/mavros/set_mode" />
+        </node>
+    </group>
+
+    <group ns="uav2">
+        <node pkg="state_machine" type="test_point.py" name="test_point" output="screen">
+            <rosparam file="$(find state_machine)/config/test_point.yaml" command="load" />
+            <remap from="~mavros/state" to="/uav2/mavros/state" />
+            <remap from="~drone_odometry" to="/uav2/drone_odometry" />
+            <remap from="~goal" to="/uav2/goal" />
+            <remap from="~state_machine" to="/uav2/state_machine" />
+            <remap from="~mavros/cmd/arming" to="/uav2/mavros/cmd/arming" />
+            <remap from="~mavros/set_mode" to="/uav2/mavros/set_mode" />
+        </node>
+    </group>
+</launch>

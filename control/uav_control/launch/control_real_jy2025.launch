@@ -1,0 +1,61 @@
+<launch>
+    <arg name="traj_id" default="0"/>
+    <arg name="auto_offboard" default="false" />
+    <arg name="uav1_inertial_origin_x" default="-3.0" /> <!-- 惯性系下两机坐标 -->
+    <arg name="uav1_inertial_origin_y" default="-1.0" />
+    <arg name="uav1_inertial_origin_z" default="0.1" />
+    <arg name="uav1_local_to_inertial_yaw_deg" default="90.0" />
+    <arg name="uav2_inertial_origin_x" default="3.0" />
+    <arg name="uav2_inertial_origin_y" default="-1.0" />
+    <arg name="uav2_inertial_origin_z" default="0.1" />
+    <arg name="uav2_local_to_inertial_yaw_deg" default="90.0" />
+
+
+    <!-- <include file="$(find px4_sim)/launch/sim.launch" /> -->
+
+    <group ns="uav1">
+        <node pkg="uav_control" name="track_mpc_uav1" type="tracking_real_jy2025.py" output="screen">
+            <param name="auto_offboard" value="$(arg auto_offboard)"/>
+            <param name="uav_name" value="uav1"/>
+            <param name="publish_mpc_pred_traj" value="true"/>
+            <!-- Swarm-LIO publishes pose and linear velocity in uav1/world. -->
+            <param name="odom_twist_in_world" value="true"/>
+            <param name="use_lidar_height_override" value="false"/>
+            <param name="inertial_origin_x" value="$(arg uav1_inertial_origin_x)" type="double"/>
+            <param name="inertial_origin_y" value="$(arg uav1_inertial_origin_y)" type="double"/>
+            <param name="inertial_origin_z" value="$(arg uav1_inertial_origin_z)" type="double"/>
+            <param name="local_to_inertial_yaw_deg" value="$(arg uav1_local_to_inertial_yaw_deg)" type="double"/>
+
+            <remap from="~odom" to="/uav1/Odometry" />
+            <remap from="~track_traj" to="/uav1/mpc_trajectory" />
+            <remap from="~cmd_vel" to="/uav1/cmd_vel" />
+            <remap from="~setpoint_raw" to="/uav1/mavros/setpoint_raw/attitude" />
+            <remap from="~state" to="/uav1/mavros/state" />
+        </node>
+    </group>
+
+    <group ns="uav2">
+        <node pkg="uav_control" name="track_mpc_uav2" type="tracking_real_jy2025.py" output="screen">
+            <param name="auto_offboard" value="$(arg auto_offboard)"/>
+            <param name="uav_name" value="uav2"/>
+            <param name="publish_mpc_pred_traj" value="true"/>
+            <!-- Swarm-LIO publishes pose and linear velocity in uav2/world. -->
+            <param name="odom_twist_in_world" value="true"/>
+            <param name="use_lidar_height_override" value="false"/>
+            <param name="inertial_origin_x" value="$(arg uav2_inertial_origin_x)" type="double"/>
+            <param name="inertial_origin_y" value="$(arg uav2_inertial_origin_y)" type="double"/>
+            <param name="inertial_origin_z" value="$(arg uav2_inertial_origin_z)" type="double"/>
+            <param name="local_to_inertial_yaw_deg" value="$(arg uav2_local_to_inertial_yaw_deg)" type="double"/>
+
+            <remap from="~odom" to="/uav2/Odometry" />
+            <remap from="~track_traj" to="/uav2/mpc_trajectory" />
+            <remap from="~cmd_vel" to="/uav2/cmd_vel" />
+            <remap from="~setpoint_raw" to="/uav2/mavros/setpoint_raw/attitude" />
+            <remap from="~state" to="/uav2/mavros/state" />
+        </node>
+    </group>
+
+    <!-- <node pkg="uav_control" name="test_traj_pub" type="test_traj_pub.py" output="screen" /> -->
+    <!-- <include file="$(find ius_visualization)/launch/test.launch" /> -->
+    <!-- <node name="rviz_mpc" pkg="rviz" type="rviz" args="-d $(find uav_control)/launch/test_mpc_tarj.rviz"/>-->
+</launch>

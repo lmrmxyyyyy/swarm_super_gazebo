@@ -1,0 +1,4 @@
+<launch>
+   <node pkg="state_machine" type="an_yang_test.py" name="an_yang" output="screen">
+   </node>
+</launch>

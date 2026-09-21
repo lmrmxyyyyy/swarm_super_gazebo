@@ -1,0 +1,21 @@
+<launch>
+    <!-- Dual UAV State Machine Launch -->
+    <!-- This launch file starts state machine for both UAV1 and UAV2 -->
+    
+    <!-- Start state machine for UAV1 -->
+    <include file="$(find state_machine)/launch/jy_state_machine_sim.launch">
+        <arg name="uav_name" value="uav1" />
+        <arg name="initial_x" value="0.0" />
+        <arg name="initial_y" value="0.0" />
+        <arg name="initial_z" value="0.0" />
+    </include>
+    
+    <!-- Start state machine for UAV2 -->
+    <include file="$(find state_machine)/launch/jy_state_machine_sim.launch">
+        <arg name="uav_name" value="uav2" />
+        <arg name="initial_x" value="3.0" />
+        <arg name="initial_y" value="0.0" />
+        <arg name="initial_z" value="0.0" />
+    </include>
+    
+</launch>

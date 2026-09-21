@@ -1,0 +1,37 @@
+<launch>
+<!-- Launch file for Livox AVIA LiDAR -->
+
+	<arg name="uav_name" default="uav1" />
+	<arg name="rviz" default="true" />
+
+	<group ns="$(arg uav_name)">
+		<node pkg="point_lio" type="pointlio_mapping" name="laserMapping" output="screen">
+		<rosparam command="load" file="$(find point_lio)/config/mid360.yaml" />
+		<param name="use_imu_as_input" type="bool" value="0"/> <!--change to 1 to use IMU as input of Point-LIO-->
+		<param name="prop_at_freq_of_imu" type="bool" value="1"/>
+		<param name="check_satu" type="bool" value="1"/>
+		<param name="init_map_size" type="int" value="10"/>
+		<param name="point_filter_num" type="int" value="1"/> <!--4, 3--> 
+		<param name="space_down_sample" type="bool" value="1" />  
+		<param name="filter_size_surf" type="double" value="0.3" /> <!--0.5, 0.3, 0.2, 0.15, 0.1--> 
+		<param name="filter_size_map" type="double" value="0.3" /> <!--0.5, 0.3, 0.15, 0.1-->
+		<param name="ivox_nearby_type" type="int" value="6" /> <!--0.5, 0.3, 0.15, 0.1-->
+		<param name="runtime_pos_log_enable" type="bool" value="0" /> <!--1-->
+		<param name="use_relocal_odom" type="bool" value="1" /> <!--1-->
+		
+		<!-- Remap topics from hardcoded names to namespaced names -->
+		<remap from="/Odometry" to="/$(arg uav_name)/Odometry" />
+		<remap from="/cloud_registered" to="/$(arg uav_name)/cloud_registered" />
+		<remap from="/cloud_effected" to="/$(arg uav_name)/cloud_effected" />
+		<remap from="/Laser_map" to="/$(arg uav_name)/Laser_map" />
+		<remap from="/path" to="/$(arg uav_name)/path" />
+		<remap from="/mavros/vision_pose/pose" to="/$(arg uav_name)/mavros/vision_pose/pose" />
+		</node>
+		<group if="$(arg rviz)">
+		<node launch-prefix="nice" pkg="rviz" type="rviz" name="rviz_$(arg uav_name)" args="-d $(find point_lio)/rviz_cfg/loam_livox.rviz" />
+		</group>
+	</group>
+
+	<!-- launch-prefix="valgrind"  -->
+
+</launch>
