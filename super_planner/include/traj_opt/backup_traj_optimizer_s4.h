@@ -111,6 +111,16 @@ namespace traj_opt {
             double trigger_static_clearance{0.8};
             double trigger_static_weight{1.0};
             double trigger_swarm_weight{1.0};
+            double ts_delay_weight{0.0};
+            double ts_delay_high_order_weight{0.0};
+            double ts_delay_deadband{0.0};
+            double reference_ts{0.0};
+            double ts_anchor_weight{0.0};
+            double ts_anchor_deadband{0.0};
+            Vec3f tail_anchor_pos{Vec3f::Zero()};
+            double tail_anchor_weight{0.0};
+            double tail_anchor_deadband{0.0};
+            double time_balance_weight{0.0};
 
             double init_ts;
             VecDf init_t_vec;

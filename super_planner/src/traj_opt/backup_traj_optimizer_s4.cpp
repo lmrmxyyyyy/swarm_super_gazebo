@@ -23,6 +23,7 @@
 
 #include <traj_opt/backup_traj_optimizer_s4.h>
 #include <utils/header/color_msg_utils.hpp>
+
 #include <array>
 
 using namespace traj_opt;
@@ -30,16 +31,46 @@ using namespace color_text;
 using namespace super_utils;
 
 namespace {
-    double densitySigmoid(const double value) {
+    constexpr double kMinStablePieceTime = 0.05;
+    constexpr double kMinMappedPieceTime = 1.0e-3;
+    constexpr double kInvalidCost = 1.0e12;
+
+    double squaredBoundViolationTolerance(const double bound, const double margin) {
+        const double allowed_bound = bound * (1.0 + margin);
+        return allowed_bound * allowed_bound - bound * bound;
+    }
+
+    double thrustViolationTolerance(const traj_opt::Config &cfg) {
+        const double thrust_min = cfg.min_acc_thr * cfg.mass;
+        const double thrust_max = cfg.max_acc_thr * cfg.mass;
+        const double radius = 0.5 * std::abs(thrust_max - thrust_min);
+        const double bound = std::max(std::abs(thrust_min), std::abs(thrust_max));
+        const double allowed_radius = radius + bound * cfg.penna_margin;
+        return allowed_radius * allowed_radius - radius * radius;
+    }
+
+    void forwardMapTauToBoundedT(const Eigen::VectorXd &tau, Eigen::VectorXd &times) {
+        gcopter::forwardMapTauToT(tau, times);
+        times.array() += kMinStablePieceTime;
+    }
+
+    template<typename EIGENVEC>
+    void backwardMapBoundedTToTau(const Eigen::VectorXd &times, EIGENVEC &tau) {
+        const Eigen::VectorXd positive_times =
+                (times.array() - kMinStablePieceTime).max(kMinMappedPieceTime).matrix();
+        gcopter::backwardMapTToTau(positive_times, tau);
+    }
+
+    double sigmoid(const double value) {
         const double e = std::exp(value >= 0.0 ? -value : value);
         return value >= 0.0 ? 1.0 / (1.0 + e) : e / (1.0 + e);
     }
 
-    void evaluateBackupLocalDensity(const Vec3f &self_pos, const double query_wt,
-                                    const vector<SwarmPrediction> &predictions,
-                                    const double radius_x, const double radius_y, const double radius_z,
-                                    const double smooth_eps, const double time_inflation,
-                                    double &neighbor_count, Vec3f &grad_pos, double &grad_time) {
+    void evaluateLocalDensity(const Vec3f &self_pos, const double query_wt,
+                              const vector<SwarmPrediction> &predictions,
+                              const double radius_x, const double radius_y, const double radius_z,
+                              const double smooth_eps, const double time_inflation,
+                              double &neighbor_count, Vec3f &grad_pos, double &grad_time) {
         neighbor_count = 0.0;
         grad_pos.setZero();
         grad_time = 0.0;
@@ -59,8 +90,9 @@ namespace {
                 Vec3f other_pos, other_vel;
                 if (!prediction.sample(query_wt + offsets[k], other_pos, other_vel)) continue;
                 const Vec3f delta = other_pos - self_pos;
-                const double distance = std::sqrt(delta.cwiseQuotient(radii).squaredNorm() + eps * eps);
-                const double occupancy = densitySigmoid((1.0 - distance) / eps);
+                const double distance =
+                        std::sqrt(delta.cwiseQuotient(radii).squaredNorm() + eps * eps);
+                const double occupancy = sigmoid((1.0 - distance) / eps);
                 const Vec3f occupancy_grad = occupancy * (1.0 - occupancy) *
                         delta.cwiseQuotient(radii.cwiseProduct(radii)) / (distance * eps);
                 count += weights[k] * occupancy;
@@ -81,6 +113,7 @@ namespace {
         density = 0.0;
         grad_pos.setZero();
         if (h_poly.rows() == 0 || clearance_radius <= 0.0) return;
+
         const double eps = std::max(1.0e-3, smooth_eps);
         for (int row = 0; row < h_poly.rows(); ++row) {
             Vec3f normal = h_poly.block<1, 3>(row, 0);
@@ -88,7 +121,7 @@ namespace {
             if (normal_norm <= 1.0e-6) continue;
             normal /= normal_norm;
             const double clearance = -(normal.dot(position) + h_poly(row, 3) / normal_norm);
-            const double occupancy = densitySigmoid((clearance_radius - clearance) / eps);
+            const double occupancy = sigmoid((clearance_radius - clearance) / eps);
             density += occupancy;
             grad_pos += occupancy * (1.0 - occupancy) * normal / eps;
         }
@@ -240,11 +273,10 @@ void BackupTrajOpt::constraintsFunctional(const Eigen::VectorXd &T,
             if (local_density_en && local_density_weight > 0.0 && !swarm_predictions.empty()) {
                 double neighbor_count;
                 Vec3f density_pos_grad;
-                evaluateBackupLocalDensity(pos, trajectory_start_wt + piece_start_t + s1, swarm_predictions,
-                                           local_density_radius_x, local_density_radius_y,
-                                           local_density_radius_z, local_density_smooth_eps,
-                                           local_density_time_inflation, neighbor_count,
-                                           density_pos_grad, density_time_grad);
+                evaluateLocalDensity(pos, trajectory_start_wt + piece_start_t + s1, swarm_predictions,
+                                     local_density_radius_x, local_density_radius_y, local_density_radius_z,
+                                     local_density_smooth_eps, local_density_time_inflation,
+                                     neighbor_count, density_pos_grad, density_time_grad);
                 const double density_scale = 2.0 * local_density_weight * neighbor_count;
                 pena += local_density_weight * neighbor_count * neighbor_count;
                 gradPos += density_scale * density_pos_grad;
@@ -363,13 +395,24 @@ double BackupTrajOpt::costFunctional(void *ptr, const Eigen::VectorXd &x, Eigen:
     const long dimXi = obj.spatialDim;
     const double weightT = obj.rho;
     const double weight_ts = obj.weight_ts;
+    const bool optimize_ts = obj.weight_ts > 0.0 ||
+                             obj.ts_delay_weight > 0.0 ||
+                             obj.ts_delay_high_order_weight > 0.0 ||
+                             obj.ts_anchor_weight > 0.0 ||
+                             obj.trigger_density_weight > 0.0;
     Eigen::Map<const Eigen::VectorXd> tau(x.data(), dimTau);
     Eigen::Map<const Eigen::VectorXd> xi(x.data() + dimTau, dimXi);
     double tau_s = x(x.size() - 1);
     Eigen::Map<Eigen::VectorXd> gradTau(g.data(), dimTau);
     Eigen::Map<Eigen::VectorXd> gradXi(g.data() + dimTau, dimXi);
-    double gradTaus = g(g.size() - 1);
-    gcopter::forwardMapTauToT(tau, obj.times);
+    double gradTaus = 0.0;
+    forwardMapTauToBoundedT(tau, obj.times);
+    if (!obj.times.allFinite()) {
+        g.setZero();
+        obj.penalty_log.setZero();
+        obj.penalty_log(0) = kInvalidCost;
+        return kInvalidCost;
+    }
 
     switch (obj.pos_constraint_type) {
         case 1: {
@@ -382,9 +425,15 @@ double BackupTrajOpt::costFunctional(void *ptr, const Eigen::VectorXd &x, Eigen:
             break;
         }
     }
+    if (!obj.points.allFinite()) {
+        g.setZero();
+        obj.penalty_log.setZero();
+        obj.penalty_log(0) = kInvalidCost;
+        return kInvalidCost;
+    }
 
 
-    if (obj.weight_ts > 0) {
+    if (optimize_ts) {
         gcopter::mapInfToInterval(obj.min_ts, obj.max_ts, tau_s, obj.ts);
     }
 
@@ -395,6 +444,12 @@ double BackupTrajOpt::costFunctional(void *ptr, const Eigen::VectorXd &x, Eigen:
     obj.minco.setConditions(headPVAJ, tailPVAJ);
     // points在这里是没有用的
     obj.minco.setParameters(obj.points.leftCols(obj.piece_num - 1), obj.times);
+    if (!obj.minco.getCoeffs().allFinite()) {
+        g.setZero();
+        obj.penalty_log.setZero();
+        obj.penalty_log(0) = kInvalidCost;
+        return kInvalidCost;
+    }
     double cost = 0;
     obj.partialGradByCoeffs.setZero();
     obj.partialGradByTimes.setZero();
@@ -402,6 +457,12 @@ double BackupTrajOpt::costFunctional(void *ptr, const Eigen::VectorXd &x, Eigen:
         obj.minco.getEnergy(cost);
         obj.minco.getEnergyPartialGradByCoeffs(obj.partialGradByCoeffs);
         obj.minco.getEnergyPartialGradByTimes(obj.partialGradByTimes);
+    }
+    if (!std::isfinite(cost) || !obj.partialGradByCoeffs.allFinite() || !obj.partialGradByTimes.allFinite()) {
+        g.setZero();
+        obj.penalty_log.setZero();
+        obj.penalty_log(0) = kInvalidCost;
+        return kInvalidCost;
     }
     obj.penalty_log.setZero();
     obj.penalty_log(0) = cost;
@@ -417,6 +478,12 @@ double BackupTrajOpt::costFunctional(void *ptr, const Eigen::VectorXd &x, Eigen:
                           cost, obj.partialGradByTimes, obj.partialGradByCoeffs,
                           density_grad_ts,
                           obj.penalty_log);
+    if (!std::isfinite(cost) || !obj.partialGradByCoeffs.allFinite() || !obj.partialGradByTimes.allFinite()) {
+        g.setZero();
+        obj.penalty_log.setZero();
+        obj.penalty_log(0) = kInvalidCost;
+        return kInvalidCost;
+    }
 
     StatePVAJ partGradOfHeadPVAJ, partGradOfTailPVAJ;
     Mat3Df partGradOfWaypts;
@@ -425,10 +492,35 @@ double BackupTrajOpt::costFunctional(void *ptr, const Eigen::VectorXd &x, Eigen:
                                             partGradOfHeadPVAJ,
                                             partGradOfWaypts,
                                             partGradOfTailPVAJ);
+    if (!obj.gradByTimes.allFinite() || !partGradOfHeadPVAJ.allFinite() ||
+        !partGradOfWaypts.allFinite() || !partGradOfTailPVAJ.allFinite()) {
+        g.setZero();
+        obj.penalty_log.setZero();
+        obj.penalty_log(0) = kInvalidCost;
+        return kInvalidCost;
+    }
     cost += weightT * obj.times.sum();
     obj.gradByTimes.array() += weightT;
     obj.gradByPoints.leftCols(obj.piece_num - 1) = partGradOfWaypts;
     obj.gradByPoints.rightCols(1) = partGradOfTailPVAJ.col(0);
+
+    if (obj.tail_anchor_weight > 0.0 && obj.tail_anchor_pos.allFinite()) {
+        const Vec3f tail_delta = obj.points.col(obj.points.cols() - 1) - obj.tail_anchor_pos;
+        const double tail_deadband = std::max(0.0, obj.tail_anchor_deadband);
+        const double viola_tail = tail_delta.squaredNorm() - tail_deadband * tail_deadband;
+        double tail_pena, tail_pena_d;
+        if (gcopter::smoothedL1(viola_tail, obj.smooth_eps, tail_pena, tail_pena_d)) {
+            cost += obj.tail_anchor_weight * tail_pena;
+            obj.gradByPoints.rightCols(1) += obj.tail_anchor_weight * tail_pena_d * 2.0 * tail_delta;
+        }
+    }
+
+    if (obj.time_balance_weight > 0.0 && obj.times.size() > 1) {
+        const double mean_time = obj.times.mean();
+        const Eigen::VectorXd time_delta = (obj.times.array() - mean_time).matrix();
+        cost += obj.time_balance_weight * time_delta.squaredNorm();
+        obj.gradByTimes += 2.0 * obj.time_balance_weight * time_delta;
+    }
 
     gcopter::propagateGradientTToTau(tau, obj.gradByTimes, gradTau);
     switch (obj.pos_constraint_type) {
@@ -443,8 +535,14 @@ double BackupTrajOpt::costFunctional(void *ptr, const Eigen::VectorXd &x, Eigen:
             break;
         }
     }
+    if (!std::isfinite(cost) || !gradTau.allFinite() || !gradXi.allFinite()) {
+        g.setZero();
+        obj.penalty_log.setZero();
+        obj.penalty_log(0) = kInvalidCost;
+        return kInvalidCost;
+    }
     // Add ts cost and gradient;
-    if (obj.weight_ts > 0) {
+    if (optimize_ts) {
         // square cost
 //        cost += weight_ts * pow(obj.bod_.t_e - obj.ts, 2);
 //        obj.gradTs =
@@ -468,13 +566,43 @@ double BackupTrajOpt::costFunctional(void *ptr, const Eigen::VectorXd &x, Eigen:
 //        gcopter::propagateGradIntervalToInf(obj.bod_.t_0, obj.bod_.t_e, tau_s, gradTs, gradTaus);
 //        g(g.size() - 1) = gradTaus;
 
-        cost += weight_ts * (obj.max_ts - obj.ts);
+        cost += weight_ts > 0.0 ? weight_ts * (obj.max_ts - obj.ts) : 0.0;
         obj.gradTs =
                 partGradOfHeadPVAJ.col(0).dot(obj.exp_traj.getVel(obj.ts)) +
                 partGradOfHeadPVAJ.col(1).dot(obj.exp_traj.getAcc(obj.ts)) +
                 partGradOfHeadPVAJ.col(2).dot(obj.exp_traj.getJer(obj.ts)) +
                 partGradOfHeadPVAJ.col(3).dot(obj.exp_traj.getSnap(obj.ts)) +
-                -weight_ts + density_grad_ts;
+                (weight_ts > 0.0 ? -weight_ts : 0.0) + density_grad_ts;
+
+        if (obj.ts_delay_weight > 0.0) {
+            const double target_ts = obj.max_ts - std::max(0.0, obj.ts_delay_deadband);
+            const double early_switch = target_ts - obj.ts;
+            if (early_switch > 0.0) {
+                cost += obj.ts_delay_weight * early_switch * early_switch;
+                obj.gradTs += -2.0 * obj.ts_delay_weight * early_switch;
+            }
+        }
+
+        if (obj.ts_delay_high_order_weight > 0.0) {
+            const double target_ts = obj.max_ts - std::max(0.0, obj.ts_delay_deadband);
+            const double early_switch = target_ts - obj.ts;
+            if (early_switch > 0.0) {
+                const double early_switch_sqr = early_switch * early_switch;
+                cost += obj.ts_delay_high_order_weight * early_switch_sqr * early_switch_sqr;
+                obj.gradTs += -4.0 * obj.ts_delay_high_order_weight * early_switch_sqr * early_switch;
+            }
+        }
+
+        if (obj.ts_anchor_weight > 0.0 && std::isfinite(obj.reference_ts)) {
+            const double ts_delta = obj.ts - obj.reference_ts;
+            const double ts_deadband = std::max(0.0, obj.ts_anchor_deadband);
+            const double viola_ts = ts_delta * ts_delta - ts_deadband * ts_deadband;
+            double ts_pena, ts_pena_d;
+            if (gcopter::smoothedL1(viola_ts, obj.smooth_eps, ts_pena, ts_pena_d)) {
+                cost += obj.ts_anchor_weight * ts_pena;
+                obj.gradTs += obj.ts_anchor_weight * ts_pena_d * 2.0 * ts_delta;
+            }
+        }
 
         if (obj.trigger_density_weight > 0.0) {
             const Vec3f trigger_pos = obj.exp_traj.getPos(obj.ts);
@@ -484,21 +612,27 @@ double BackupTrajOpt::costFunctional(void *ptr, const Eigen::VectorXd &x, Eigen:
             evaluateStaticDensity(trigger_pos, obj.hPolytope, obj.trigger_static_clearance,
                                   obj.local_density_smooth_eps, static_density, static_grad_pos);
             if (!obj.swarm_predictions.empty()) {
-                evaluateBackupLocalDensity(trigger_pos, obj.exp_traj.start_WT + obj.ts,
-                                           obj.swarm_predictions, obj.local_density_radius_x,
-                                           obj.local_density_radius_y, obj.local_density_radius_z,
-                                           obj.local_density_smooth_eps, obj.local_density_time_inflation,
-                                           swarm_density, swarm_grad_pos, swarm_time_grad);
+                evaluateLocalDensity(trigger_pos, obj.exp_traj.start_WT + obj.ts, obj.swarm_predictions,
+                                     obj.local_density_radius_x, obj.local_density_radius_y,
+                                     obj.local_density_radius_z, obj.local_density_smooth_eps,
+                                     obj.local_density_time_inflation, swarm_density,
+                                     swarm_grad_pos, swarm_time_grad);
             }
-            const double trigger_density = obj.trigger_static_weight * static_density +
-                                           obj.trigger_swarm_weight * swarm_density;
-            const double trigger_density_grad_ts = obj.trigger_static_weight * static_grad_pos.dot(trigger_vel) +
+
+            const double trigger_density =
+                    obj.trigger_static_weight * static_density + obj.trigger_swarm_weight * swarm_density;
+            const double trigger_density_grad_ts =
+                    obj.trigger_static_weight * static_grad_pos.dot(trigger_vel) +
                     obj.trigger_swarm_weight * (swarm_grad_pos.dot(trigger_vel) + swarm_time_grad);
             const double trigger_window = std::max(1.0e-3, obj.max_ts - obj.min_ts);
             const double trigger_progress = (obj.ts - obj.min_ts) / trigger_window;
-            cost += obj.trigger_density_weight * trigger_density * trigger_progress * trigger_progress;
+            const double trigger_progress_sqr = trigger_progress * trigger_progress;
+            const double trigger_cost =
+                    obj.trigger_density_weight * trigger_density * trigger_progress_sqr;
+
+            cost += trigger_cost;
             obj.gradTs += obj.trigger_density_weight *
-                    (trigger_density_grad_ts * trigger_progress * trigger_progress +
+                    (trigger_density_grad_ts * trigger_progress_sqr +
                      2.0 * trigger_density * trigger_progress / trigger_window);
         }
 
@@ -507,6 +641,12 @@ double BackupTrajOpt::costFunctional(void *ptr, const Eigen::VectorXd &x, Eigen:
 
     } else {
         g(g.size() - 1) = 0;
+    }
+    if (!std::isfinite(cost) || !g.allFinite()) {
+        g.setZero();
+        obj.penalty_log.setZero();
+        obj.penalty_log(0) = kInvalidCost;
+        return kInvalidCost;
     }
     return cost;
 }
@@ -580,9 +720,22 @@ double BackupTrajOpt::optimize(Trajectory &traj, const double &relCostTol) {
         opt_vars.ts = opt_vars.given_init_ts;
     }
 
-    gcopter::backwardMapTToTau(opt_vars.times, tau);
+    if (!opt_vars.headPVAJ.allFinite() || !opt_vars.tailPVAJ.allFinite() ||
+        !opt_vars.times.allFinite() || opt_vars.times.minCoeff() < kMinStablePieceTime ||
+        !opt_vars.points.allFinite() || !std::isfinite(opt_vars.ts)) {
+        cout << YELLOW << " -- [TrajOpt] Error, invalid backup init state/time/points, force return." << RESET << endl;
+        cout << " -- Head PVAJ: " << endl;
+        cout << opt_vars.headPVAJ << endl;
+        cout << " -- Tail PVAJ: " << endl;
+        cout << opt_vars.tailPVAJ << endl;
+        cout << " -- Times: " << endl;
+        cout << opt_vars.times.transpose() << endl;
+        return INFINITY;
+    }
+
+    backwardMapBoundedTToTau(opt_vars.times, tau);
     Eigen::VectorXd tt;
-    gcopter::forwardMapTauToT(tau, tt);
+    forwardMapTauToBoundedT(tau, tt);
     switch (opt_vars.pos_constraint_type) {
         case 1: {
             MatDf p_e = opt_vars.points;
@@ -643,11 +796,15 @@ double BackupTrajOpt::optimize(Trajectory &traj, const double &relCostTol) {
         cout << "\tThr: " << opt_vars.penalty_log(7) << endl;
         cout << "\tTs: " << opt_vars.ts << endl;
     }
+    const double vel_violation_tol = squaredBoundViolationTolerance(cfg_.max_vel, cfg_.penna_margin);
+    const double acc_violation_tol = squaredBoundViolationTolerance(cfg_.max_acc, cfg_.penna_margin);
+    const double omg_violation_tol = squaredBoundViolationTolerance(cfg_.max_omg, cfg_.penna_margin);
+    const double thr_violation_tol = thrustViolationTolerance(cfg_);
     if ((cfg_.penna_pos > 0 && opt_vars.penalty_log(1) > 0.2) ||
-        (cfg_.penna_vel > 0 && opt_vars.penalty_log(2) > cfg_.max_vel * cfg_.penna_margin) ||
-        (cfg_.penna_acc > 0 && opt_vars.penalty_log(3) > cfg_.max_acc * cfg_.penna_margin) ||
-        (cfg_.penna_omg > 0 && opt_vars.penalty_log(6) > cfg_.max_omg * cfg_.penna_margin) ||
-        (cfg_.penna_thr > 0 && opt_vars.penalty_log(7) > cfg_.max_acc * cfg_.penna_margin)) {
+        (cfg_.penna_vel > 0 && opt_vars.penalty_log(2) > vel_violation_tol) ||
+        (cfg_.penna_acc > 0 && opt_vars.penalty_log(3) > acc_violation_tol) ||
+        (cfg_.penna_omg > 0 && opt_vars.penalty_log(6) > omg_violation_tol) ||
+        (cfg_.penna_thr > 0 && opt_vars.penalty_log(7) > thr_violation_tol)) {
         ret = -1;
         if (cfg_.print_optimizer_log) {
             cout << " -- [BaclOpt] Opt finish, with iter num: " << opt_vars.iter_num << "\n";
@@ -666,7 +823,7 @@ double BackupTrajOpt::optimize(Trajectory &traj, const double &relCostTol) {
 
     if (ret >= 0) {
         VecDf Ts;
-        gcopter::forwardMapTauToT(tau, opt_vars.times);
+        forwardMapTauToBoundedT(tau, opt_vars.times);
         switch (opt_vars.pos_constraint_type) {
             case 1: {
                 VecDf xi_e = xi;
@@ -730,19 +887,34 @@ BackupTrajOpt::BackupTrajOpt(const traj_opt::Config &cfg, const ros_interface::R
     opt_vars.trigger_static_clearance = cfg_.trigger_static_clearance;
     opt_vars.trigger_static_weight = cfg_.trigger_static_weight;
     opt_vars.trigger_swarm_weight = cfg_.trigger_swarm_weight;
+    opt_vars.ts_delay_weight = cfg_.ts_delay_weight;
+    opt_vars.ts_delay_high_order_weight = cfg_.ts_delay_high_order_weight;
+    opt_vars.ts_delay_deadband = cfg_.ts_delay_deadband;
+    opt_vars.ts_anchor_weight = cfg_.ts_anchor_weight;
+    opt_vars.ts_anchor_deadband = cfg_.ts_anchor_deadband;
+    opt_vars.tail_anchor_weight = cfg_.tail_anchor_weight;
+    opt_vars.tail_anchor_deadband = cfg_.tail_anchor_deadband;
+    opt_vars.time_balance_weight = cfg_.time_balance_weight;
 }
 
 bool BackupTrajOpt::checkTrajMagnitudeBound(Trajectory &out_traj) {
-    if (cfg_.penna_vel > 0 && out_traj.getMaxVelRate() > 1.2 * cfg_.max_vel) {
-        std::cout << YELLOW << " -- [TrajOpt] Minco backup opt failed." << RESET << std::endl;
-        std::cout << YELLOW << "\t\tBackend Max vel:\t" << out_traj.getMaxVelRate() << " m/s" << RESET
-                  << std::endl;
+    if (out_traj.empty() || !std::isfinite(out_traj.getTotalDuration()) ||
+        out_traj.getTotalDuration() <= kMinStablePieceTime) {
+        std::cout << YELLOW << " -- [TrajOpt] Minco backup opt produced invalid trajectory." << RESET << std::endl;
         return false;
     }
-    if (cfg_.penna_acc > 0 && out_traj.getMaxAccRate() > 1.2 * cfg_.max_acc) {
+
+    const double max_vel_rate = out_traj.getMaxVelRate();
+    if (!std::isfinite(max_vel_rate) || (cfg_.penna_vel > 0 && max_vel_rate > 1.2 * cfg_.max_vel)) {
         std::cout << YELLOW << " -- [TrajOpt] Minco backup opt failed." << RESET << std::endl;
-        std::cout << YELLOW << "\t\tBackend Max Acc:\t" << out_traj.getMaxAccRate() << " m/s" << RESET
-                  << std::endl;
+        std::cout << YELLOW << "\t\tBackend Max vel:\t" << max_vel_rate << " m/s" << RESET << std::endl;
+        return false;
+    }
+
+    const double max_acc_rate = out_traj.getMaxAccRate();
+    if (!std::isfinite(max_acc_rate) || (cfg_.penna_acc > 0 && max_acc_rate > 1.2 * cfg_.max_acc)) {
+        std::cout << YELLOW << " -- [TrajOpt] Minco backup opt failed." << RESET << std::endl;
+        std::cout << YELLOW << "\t\tBackend Max Acc:\t" << max_acc_rate << " m/s" << RESET << std::endl;
         return false;
     }
     return true;
@@ -761,8 +933,16 @@ BackupTrajOpt::optimize(const Trajectory &exp_traj,
                         const vector<SwarmPrediction> &swarm_predictions,
                         const bool &debug) {
     opt_vars.hPolytope = sfc.GetPlanes();
-    if (std::isnan(opt_vars.hPolytope.sum())) {
-        std::cout << YELLOW << " -- [BackTrajOpt] Polytope is nan." << RESET << std::endl;
+    out_traj.clear();
+    out_ts = heu_ts;
+    if (!std::isfinite(t_0) || !std::isfinite(t_e) || !std::isfinite(heu_ts) ||
+        !std::isfinite(heu_dur) || t_e <= t_0 + kMinStablePieceTime ||
+        heu_ts < t_0 || heu_ts > t_e || heu_dur <= kMinStablePieceTime ||
+        cfg_.piece_num <= 0 || !heu_end_pt.allFinite() || exp_traj.empty() ||
+        !std::isfinite(exp_traj.getTotalDuration()) ||
+        exp_traj.getTotalDuration() <= kMinStablePieceTime ||
+        opt_vars.hPolytope.size() == 0 || !opt_vars.hPolytope.allFinite()) {
+        std::cout << YELLOW << " -- [BackTrajOpt] Invalid backup optimization input." << RESET << std::endl;
         return false;
     }
 
@@ -770,7 +950,10 @@ BackupTrajOpt::optimize(const Trajectory &exp_traj,
     /// Setup optimization problems
     opt_vars.default_init = true;
     opt_vars.given_init_ts_and_ps = false;
-    opt_vars.headPVAJ = exp_traj.getState(heu_ts);
+    if (!exp_traj.getState(heu_ts, opt_vars.headPVAJ)) {
+        std::cout << YELLOW << " -- [BackTrajOpt] Invalid backup head state." << RESET << std::endl;
+        return false;
+    }
     opt_vars.tailPVAJ.setZero();
     opt_vars.guide_path.clear();
     opt_vars.guide_t.clear();
@@ -779,12 +962,16 @@ BackupTrajOpt::optimize(const Trajectory &exp_traj,
     opt_vars.piece_num = cfg_.piece_num;
     opt_vars.max_ts = t_e;
     opt_vars.min_ts = t_0;
+    opt_vars.reference_ts = heu_ts;
+    opt_vars.tail_anchor_pos = heu_end_pt;
     opt_vars.tailPVAJ.col(0) = heu_end_pt;
     opt_vars.times.resize(opt_vars.piece_num);
+    const double min_init_duration =
+            static_cast<double>(opt_vars.piece_num) * (kMinStablePieceTime + kMinMappedPieceTime);
+    heu_dur = std::max(heu_dur, min_init_duration);
     opt_vars.times.setConstant(heu_dur / opt_vars.piece_num);
     opt_vars.ts = heu_ts;
 
-    out_traj.clear();
     PolyhedronH planes = sfc.GetPlanes();
     bool success{true};
 
@@ -793,18 +980,20 @@ BackupTrajOpt::optimize(const Trajectory &exp_traj,
         success = false;
     }
 
-    if (success && std::isinf(optimize(out_traj, cfg_.opt_accuracy))) {
+    const double opt_cost = success ? optimize(out_traj, cfg_.opt_accuracy) : INFINITY;
+    if (success && !std::isfinite(opt_cost)) {
         std::cout << YELLOW << " -- [SUPER] Minco backup_traj opt failed." << RESET << std::endl;
         success = false;
     }
 
-    if (opt_vars.penalty_log(1) > cfg_.penna_pos * 0.05) {
+    if (success && opt_vars.penalty_log.size() > 1 &&
+        opt_vars.penalty_log(1) > cfg_.penna_pos * 0.05) {
         std::cout << YELLOW << " -- [SUPER] Minco backup_traj out of corridor." << RESET << std::endl;
         success = false;
     }
     out_ts = opt_vars.ts;
 
-    if (!checkTrajMagnitudeBound(out_traj)) {
+    if (success && !checkTrajMagnitudeBound(out_traj)) {
         success = false;
     }
 
@@ -840,8 +1029,18 @@ BackupTrajOpt::optimize(const Trajectory &exp_traj,
                         Trajectory &out_traj,
                         double & out_ts) {
     opt_vars.hPolytope = sfc.GetPlanes();
-    if (std::isnan(opt_vars.hPolytope.sum())) {
-        std::cout << YELLOW << " -- [BackTrajOpt] Polytope is nan." << RESET << std::endl;
+    out_traj.clear();
+    out_ts = heu_ts;
+    if (!std::isfinite(t_0) || !std::isfinite(t_e) || !std::isfinite(heu_ts) ||
+        t_e <= t_0 + kMinStablePieceTime || heu_ts < t_0 || heu_ts > t_e ||
+        cfg_.piece_num <= 0 || exp_traj.empty() ||
+        !std::isfinite(exp_traj.getTotalDuration()) ||
+        exp_traj.getTotalDuration() <= kMinStablePieceTime ||
+        init_ps.empty() || init_t_vec.size() != cfg_.piece_num ||
+        init_ps.size() != static_cast<size_t>(cfg_.piece_num) ||
+        !init_t_vec.allFinite() || init_t_vec.minCoeff() <= kMinStablePieceTime ||
+        opt_vars.hPolytope.size() == 0 || !opt_vars.hPolytope.allFinite()) {
+        std::cout << YELLOW << " -- [BackTrajOpt] Invalid backup optimization input." << RESET << std::endl;
         return false;
     }
 
@@ -849,7 +1048,10 @@ BackupTrajOpt::optimize(const Trajectory &exp_traj,
     /// Setup optimization problems
     opt_vars.default_init = true;
 
-    opt_vars.headPVAJ = exp_traj.getState(heu_ts);
+    if (!exp_traj.getState(heu_ts, opt_vars.headPVAJ)) {
+        std::cout << YELLOW << " -- [BackTrajOpt] Invalid backup head state." << RESET << std::endl;
+        return false;
+    }
     opt_vars.tailPVAJ.setZero();
     opt_vars.guide_path.clear();
     opt_vars.guide_t.clear();
@@ -857,6 +1059,8 @@ BackupTrajOpt::optimize(const Trajectory &exp_traj,
     opt_vars.piece_num = cfg_.piece_num;
     opt_vars.max_ts = t_e;
     opt_vars.min_ts = t_0;
+    opt_vars.reference_ts = heu_ts;
+    opt_vars.tail_anchor_pos = init_ps.back();
     opt_vars.tailPVAJ.col(0) = init_ps.back();
     opt_vars.times.resize(opt_vars.piece_num);
     const double heu_dur = init_t_vec.sum();
@@ -868,7 +1072,6 @@ BackupTrajOpt::optimize(const Trajectory &exp_traj,
     opt_vars.given_init_ps = init_ps;
     opt_vars.given_init_ts = heu_ts;
 
-    out_traj.clear();
     PolyhedronH planes = sfc.GetPlanes();
     bool success{true};
 
@@ -877,18 +1080,20 @@ BackupTrajOpt::optimize(const Trajectory &exp_traj,
         success = false;
     }
 
-    if (success && std::isinf(optimize(out_traj, cfg_.opt_accuracy))) {
+    const double opt_cost = success ? optimize(out_traj, cfg_.opt_accuracy) : INFINITY;
+    if (success && !std::isfinite(opt_cost)) {
         std::cout << YELLOW << " -- [SUPER] Minco backup_traj opt failed." << RESET << std::endl;
         success = false;
     }
 
-    if (opt_vars.penalty_log(1) > cfg_.penna_pos * 0.05) {
+    if (success && opt_vars.penalty_log.size() > 1 &&
+        opt_vars.penalty_log(1) > cfg_.penna_pos * 0.05) {
         std::cout << YELLOW << " -- [SUPER] Minco backup_traj out of corridor." << RESET << std::endl;
         success = false;
     }
     out_ts = opt_vars.ts;
 
-    if (!checkTrajMagnitudeBound(out_traj)) {
+    if (success && !checkTrajMagnitudeBound(out_traj)) {
         success = false;
     }
 

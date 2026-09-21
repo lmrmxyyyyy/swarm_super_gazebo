@@ -25,6 +25,7 @@
 #include <utils/optimization/lbfgs.h>
 #include <ros_interface/ros_interface.hpp>
 #include <array>
+#include <tuple>
 
 #define POS_IDX 1
 #define VEL_IDX 2
@@ -44,6 +45,78 @@ using Vec8f = Eigen::Matrix<double, 8, 1>;
 using Mat83f = Eigen::Matrix<double, 8, 3>;
 
 namespace {
+    constexpr double kMinStablePieceTime = 0.05;
+    constexpr double kMinMappedPieceTime = 1.0e-3;
+    constexpr double kInvalidCost = 1.0e12;
+
+    double squaredBoundViolationTolerance(const double bound, const double margin) {
+        const double allowed_bound = bound * (1.0 + margin);
+        return allowed_bound * allowed_bound - bound * bound;
+    }
+
+    double thrustViolationTolerance(const traj_opt::Config &cfg) {
+        const double thrust_min = cfg.min_acc_thr * cfg.mass;
+        const double thrust_max = cfg.max_acc_thr * cfg.mass;
+        const double radius = 0.5 * std::abs(thrust_max - thrust_min);
+        const double bound = std::max(std::abs(thrust_min), std::abs(thrust_max));
+        const double allowed_radius = radius + bound * cfg.penna_margin;
+        return allowed_radius * allowed_radius - radius * radius;
+    }
+
+    bool finiteGuide(const vec_E<Vec3f> &guide_path, const std::vector<double> &guide_t) {
+        if (guide_path.empty() || guide_path.size() != guide_t.size()) {
+            return false;
+        }
+        double last_t = -std::numeric_limits<double>::infinity();
+        for (size_t i = 0; i < guide_path.size(); ++i) {
+            if (!guide_path[i].allFinite() || !std::isfinite(guide_t[i]) || guide_t[i] < last_t) {
+                return false;
+            }
+            last_t = guide_t[i];
+        }
+        return true;
+    }
+
+    bool mergeFiniteDynamicPlanes(const MatD4f &base_planes,
+                                  const MatD4f &dynamic_planes,
+                                  MatD4f &merged_planes) {
+        if (base_planes.cols() != 4 || dynamic_planes.cols() != 4 || dynamic_planes.rows() <= 0) {
+            return false;
+        }
+
+        std::vector<int> valid_rows;
+        valid_rows.reserve(dynamic_planes.rows());
+        for (int i = 0; i < dynamic_planes.rows(); ++i) {
+            const auto row = dynamic_planes.row(i);
+            const double normal_norm = row.head<3>().norm();
+            if (row.allFinite() && std::isfinite(normal_norm) && normal_norm > 1.0e-6) {
+                valid_rows.push_back(i);
+            }
+        }
+        if (valid_rows.empty()) {
+            return false;
+        }
+
+        merged_planes.resize(base_planes.rows() + static_cast<int>(valid_rows.size()), 4);
+        merged_planes.topRows(base_planes.rows()) = base_planes;
+        for (size_t i = 0; i < valid_rows.size(); ++i) {
+            merged_planes.row(base_planes.rows() + static_cast<int>(i)) = dynamic_planes.row(valid_rows[i]);
+        }
+        return true;
+    }
+
+    void forwardMapTauToBoundedT(const VecDf &tau, VecDf &times) {
+        gcopter::forwardMapTauToT(tau, times);
+        times.array() += kMinStablePieceTime;
+    }
+
+    template<typename EIGENVEC>
+    void backwardMapBoundedTToTau(const VecDf &times, EIGENVEC &tau) {
+        const VecDf positive_times =
+                (times.array() - kMinStablePieceTime).max(kMinMappedPieceTime).matrix();
+        gcopter::backwardMapTToTau(positive_times, tau);
+    }
+
     double sigmoid(const double value) {
         if (value >= 0.0) {
             const double exp_neg = std::exp(-value);
@@ -68,10 +141,12 @@ namespace {
                           std::max(1.0e-3, radius_z));
         const Vec3f normalized = delta.cwiseQuotient(radii);
         const double normalized_distance = std::sqrt(normalized.squaredNorm() + eps * eps);
+
         occupancy = sigmoid((1.0 - normalized_distance) / eps);
         const double occupancy_derivative = occupancy * (1.0 - occupancy);
-        grad_by_self_pos = occupancy_derivative * delta.cwiseQuotient(radii.cwiseProduct(radii)) /
-                           (normalized_distance * eps);
+        grad_by_self_pos =
+                occupancy_derivative * delta.cwiseQuotient(radii.cwiseProduct(radii)) /
+                (normalized_distance * eps);
     }
 
     void evaluateLocalDensity(const Vec3f &self_pos,
@@ -88,20 +163,27 @@ namespace {
         neighbor_count = 0.0;
         grad_by_self_pos.setZero();
         grad_by_query_time = 0.0;
+
         const double inflation = std::max(0.0, time_inflation);
         const std::array<double, 3> offsets{{-inflation, 0.0, inflation}};
         const std::array<double, 3> weights = inflation > 1.0e-6
                                               ? std::array<double, 3>{{0.25, 0.5, 0.25}}
                                               : std::array<double, 3>{{0.0, 1.0, 0.0}};
+
         for (const auto &prediction: predictions) {
             double prediction_occupancy = 0.0;
             Vec3f prediction_grad = Vec3f::Zero();
             double prediction_time_grad = 0.0;
             double valid_weight = 0.0;
             for (size_t k = 0; k < offsets.size(); ++k) {
-                if (weights[k] <= 0.0) continue;
+                if (weights[k] <= 0.0) {
+                    continue;
+                }
                 Vec3f other_pos, other_vel;
-                if (!prediction.sample(query_wt + offsets[k], other_pos, other_vel)) continue;
+                if (!prediction.sample(query_wt + offsets[k], other_pos, other_vel)) {
+                    continue;
+                }
+
                 double occupancy;
                 Vec3f occupancy_grad;
                 localEllipsoidOccupancy(self_pos, other_pos, radius_x, radius_y, radius_z,
@@ -111,35 +193,37 @@ namespace {
                 prediction_time_grad += weights[k] * (-occupancy_grad.dot(other_vel));
                 valid_weight += weights[k];
             }
-            if (valid_weight <= 0.0) continue;
+            if (valid_weight <= 0.0) {
+                continue;
+            }
             neighbor_count += prediction_occupancy / valid_weight;
             grad_by_self_pos += prediction_grad / valid_weight;
             grad_by_query_time += prediction_time_grad / valid_weight;
         }
     }
-
-    bool mergeDynamicPlanes(const MatD4f &base_planes, const MatD4f &dynamic_planes, MatD4f &merged_planes) {
-        if (dynamic_planes.cols() != 4 || dynamic_planes.rows() <= 0) return false;
-        merged_planes.resize(base_planes.rows() + dynamic_planes.rows(), 4);
-        merged_planes.topRows(base_planes.rows()) = base_planes;
-        merged_planes.bottomRows(dynamic_planes.rows()) = dynamic_planes;
-        return merged_planes.allFinite();
-    }
 }
 
 bool SwarmPrediction::sample(const double query_wt, Vec3f &position, Vec3f &velocity) const {
-    if (positions.empty() || positions.size() != times.size() || !std::isfinite(query_wt)) return false;
+    if (positions.empty() || positions.size() != times.size() || !std::isfinite(query_wt)) {
+        return false;
+    }
     const double relative_t = query_wt - start_wt;
-    if (relative_t < times.front() || relative_t > times.back()) return false;
+    if (relative_t < times.front() || relative_t > times.back()) {
+        return false;
+    }
     if (positions.size() == 1) {
         position = positions.front();
         velocity.setZero();
         return true;
     }
+
     auto upper = std::upper_bound(times.begin(), times.end(), relative_t);
     size_t next_idx = static_cast<size_t>(std::distance(times.begin(), upper));
-    if (next_idx == 0) next_idx = 1;
-    else if (next_idx >= times.size()) next_idx = times.size() - 1;
+    if (next_idx == 0) {
+        next_idx = 1;
+    } else if (next_idx >= times.size()) {
+        next_idx = times.size() - 1;
+    }
     const size_t prev_idx = next_idx - 1;
     const double dt = std::max(1.0e-3, times[next_idx] - times[prev_idx]);
     const double alpha = std::min(1.0, std::max(0.0, (relative_t - times[prev_idx]) / dt));
@@ -252,21 +336,6 @@ void ExpTrajOpt::constraintsFunctional(const VecDf &T,
                 }
             }
 
-            if (local_density_en && local_density_weight > 0.0 && !swarm_predictions.empty()) {
-                double neighbor_count;
-                Vec3f neighbor_count_grad;
-                double neighbor_count_time_grad;
-                const double query_wt = trajectory_start_wt + piece_start_t + s1;
-                evaluateLocalDensity(pos, query_wt, swarm_predictions,
-                                     local_density_radius_x, local_density_radius_y, local_density_radius_z,
-                                     local_density_smooth_eps, local_density_time_inflation,
-                                     neighbor_count, neighbor_count_grad, neighbor_count_time_grad);
-                const double density_scale = 2.0 * local_density_weight * neighbor_count;
-                tmp_cost += local_density_weight * neighbor_count * neighbor_count;
-                gradPos += density_scale * neighbor_count_grad;
-                local_density_time_grad = density_scale * neighbor_count_time_grad;
-            }
-
             /* 2.2  For attract point cost  *///吸引点 attractor 惩罚
             if (weightAtt > 0.0) {
                 const auto is_waypoint = (j == 0) && (i != 0);
@@ -284,6 +353,23 @@ void ExpTrajOpt::constraintsFunctional(const VecDf &T,
                         tmp_cost += weightAtt * violaAttPena;
                     }
                 }
+            }
+
+            if (local_density_en && local_density_weight > 0.0 && !swarm_predictions.empty()) {
+                double neighbor_count;
+                Vec3f neighbor_count_grad;
+                double neighbor_count_time_grad;
+                const double query_wt = trajectory_start_wt + piece_start_t + s1;
+                evaluateLocalDensity(pos, query_wt, swarm_predictions,
+                                     local_density_radius_x, local_density_radius_y, local_density_radius_z,
+                                     local_density_smooth_eps, local_density_time_inflation,
+                                     neighbor_count, neighbor_count_grad, neighbor_count_time_grad);
+
+                const double density_cost = local_density_weight * neighbor_count * neighbor_count;
+                const double density_scale = 2.0 * local_density_weight * neighbor_count;
+                tmp_cost += density_cost;
+                gradPos += density_scale * neighbor_count_grad;
+                local_density_time_grad = density_scale * neighbor_count_time_grad;
             }
 
             /* 2.3 For vel cost  */
@@ -419,7 +505,13 @@ double ExpTrajOpt::costFunctional(void *ptr,
 
     Mat3Df points;
     VecDf times;
-    gcopter::forwardMapTauToT(tau, times);
+    forwardMapTauToBoundedT(tau, times);
+    if (!times.allFinite()) {
+        g.setZero();
+        obj.penalty_log.setZero();
+        obj.penalty_log(0) = kInvalidCost;
+        return kInvalidCost;
+    }
     switch (pos_constraint_type) {
         case 1: {
             VecDf xi_e = xi;
@@ -431,11 +523,23 @@ double ExpTrajOpt::costFunctional(void *ptr,
             break;
         }
     }
+    if (!points.allFinite()) {
+        g.setZero();
+        obj.penalty_log.setZero();
+        obj.penalty_log(0) = kInvalidCost;
+        return kInvalidCost;
+    }
 
     /* 3) Compute the energy const and gradient */
     // ③ 计算轨迹能量项（最小控制量 cost）
     double cost{0};
     obj.minco.setParameters(points, times);
+    if (!obj.minco.getCoeffs().allFinite()) {
+        g.setZero();
+        obj.penalty_log.setZero();
+        obj.penalty_log(0) = kInvalidCost;
+        return kInvalidCost;
+    }
     MatD3f partialGradByCoeffs(8 * times.size(), 3);
     VecDf partialGradByTimes(times.size());
     partialGradByCoeffs.setZero();
@@ -444,6 +548,12 @@ double ExpTrajOpt::costFunctional(void *ptr,
         obj.minco.getEnergy(cost);
         obj.minco.getEnergyPartialGradByCoeffs(partialGradByCoeffs);
         obj.minco.getEnergyPartialGradByTimes(partialGradByTimes);
+    }
+    if (!std::isfinite(cost) || !partialGradByCoeffs.allFinite() || !partialGradByTimes.allFinite()) {
+        g.setZero();
+        obj.penalty_log.setZero();
+        obj.penalty_log(0) = kInvalidCost;
+        return kInvalidCost;
     }
     obj.penalty_log(0) = cost;
 
@@ -456,15 +566,28 @@ double ExpTrajOpt::costFunctional(void *ptr,
                           magnitudeBounds, penaltyWeights,
                           quadrotor_flatness, obj.swarm_predictions, obj.trajectory_start_wt,
                           obj.local_density_en, obj.local_density_radius_x, obj.local_density_radius_y,
-                          obj.local_density_radius_z, obj.local_density_smooth_eps,
-                          obj.local_density_time_inflation, obj.local_density_weight,
+                          obj.local_density_radius_z,
+                          obj.local_density_smooth_eps, obj.local_density_time_inflation,
+                          obj.local_density_weight,
                           cost, partialGradByTimes, partialGradByCoeffs, obj.penalty_log);
+    if (!std::isfinite(cost) || !partialGradByCoeffs.allFinite() || !partialGradByTimes.allFinite()) {
+        g.setZero();
+        obj.penalty_log.setZero();
+        obj.penalty_log(0) = kInvalidCost;
+        return kInvalidCost;
+    }
 
     /* 5) Propagate the gradient from CT to PT */
     Mat3Df gradByPoints;
     VecDf gradByTimes;
     obj.minco.propogateGrad(partialGradByCoeffs, partialGradByTimes,
                             gradByPoints, gradByTimes);
+    if (!gradByPoints.allFinite() || !gradByTimes.allFinite()) {
+        g.setZero();
+        obj.penalty_log.setZero();
+        obj.penalty_log(0) = kInvalidCost;
+        return kInvalidCost;
+    }
     cost += weightT * times.sum();
     gradByTimes.array() += weightT;
 
@@ -481,6 +604,12 @@ double ExpTrajOpt::costFunctional(void *ptr,
             gcopter::normRetrictionLayer(xi, vPolyIdx, vPolytopes, cost, gradXi);
             break;
         }
+    }
+    if (!std::isfinite(cost) || !gradTau.allFinite() || !gradXi.allFinite()) {
+        g.setZero();
+        obj.penalty_log.setZero();
+        obj.penalty_log(0) = kInvalidCost;
+        return kInvalidCost;
     }
     return cost;
 }
@@ -631,10 +760,24 @@ bool ExpTrajOpt::processCorridorWithGuideTraj() {///
             }
         }
     }
-     // 生成每段时间差（delta_t），最小时间差不小于 0.01s
+     // 生成每段时间差（delta_t）。guide 时间戳提供整体节奏，空间距离提供每段下限，
+     // 避免多个 corridor 吸引点映射到同一个 guide 采样点后产生过短热启动小段。
     for (int i = 1; i < time_stamps.size(); i++) {
-        opt_vars.times(i - 1) = time_stamps(i) - time_stamps(i - 1);
-        opt_vars.times(i - 1) = std::max(0.01, opt_vars.times(i - 1));
+        Vec3f from;
+        Vec3f to;
+        if (i == 1) {
+            from = opt_vars.headPVAJ.col(0);
+        } else {
+            from = opt_vars.points.col(i - 2);
+        }
+        if (i == time_stamps.size() - 1) {
+            to = opt_vars.tailPVAJ.col(0);
+        } else {
+            to = opt_vars.points.col(i - 1);
+        }
+        const double guide_dt = time_stamps(i) - time_stamps(i - 1);
+        const double distance_dt = (to - from).norm() / std::max(cfg_.max_vel, 1.0e-3);
+        opt_vars.times(i - 1) = std::max(kMinStablePieceTime, std::max(guide_dt, distance_dt));
     }
 
     if (!geometry_utils::enumerateVs(opt_vars.hPolytopes.back(), curIV)) {
@@ -683,10 +826,10 @@ bool ExpTrajOpt::setupProblemAndCheck() {
     if (opt_vars.default_init) {
         defaultInitialization();
     } else {
-        opt_vars.times *= 0.8;
+        opt_vars.times = opt_vars.times.cwiseMax(kMinStablePieceTime);
     }
 
-    if (std::isnan(opt_vars.times.sum())) {
+    if (!opt_vars.times.allFinite() || opt_vars.times.minCoeff() < kMinStablePieceTime) {
         cout << YELLOW << " -- [ExpOpt] Init times and point failed." << RESET << endl;
         return false;
     }
@@ -770,18 +913,6 @@ double ExpTrajOpt::optimize(Trajectory &traj, const double &relCostTol) {
 
     opt_vars.penalty_log.resize(8);
     opt_vars.penalty_log.setZero();
-    //② 初始化轨迹时间和点
-    /* 2) check the initial value of the optimization varibles */
-    if (opt_vars.times.minCoeff() < 1e-3) {
-        cout << YELLOW << " -- [TrajOpt] Error, the init times have zero, force return." << RESET << endl;
-        cout << " -- Head PVAJ: " << endl;
-        cout << opt_vars.headPVAJ << endl;
-        cout << " -- Head PVAJ: " << endl;
-        cout << opt_vars.tailPVAJ << endl;
-        cout << " -- Times: " << endl;
-        cout << opt_vars.times.transpose() << endl;
-        return INFINITY;
-    }
     //如果有用户提供的初始时间和空间点，就直接用它们。（exp用guid path，不用这个）
     if (opt_vars.given_init_ts_and_ps) {
         opt_vars.times = opt_vars.init_ts;
@@ -789,10 +920,24 @@ double ExpTrajOpt::optimize(Trajectory &traj, const double &relCostTol) {
             opt_vars.points.col(i) = opt_vars.init_ps[i];
         }
     }
+    //② 初始化轨迹时间和点
+    /* 2) check the initial value of the optimization varibles */
+    if (!opt_vars.headPVAJ.allFinite() || !opt_vars.tailPVAJ.allFinite() ||
+        !opt_vars.times.allFinite() || opt_vars.times.minCoeff() < kMinStablePieceTime ||
+        !opt_vars.points.allFinite()) {
+        cout << YELLOW << " -- [TrajOpt] Error, invalid init state/time/points, force return." << RESET << endl;
+        cout << " -- Head PVAJ: " << endl;
+        cout << opt_vars.headPVAJ << endl;
+        cout << " -- Tail PVAJ: " << endl;
+        cout << opt_vars.tailPVAJ << endl;
+        cout << " -- Times: " << endl;
+        cout << opt_vars.times.transpose() << endl;
+        return INFINITY;
+    }
 
     /* 3)  construct the initial guess of the optimization varibles*/
     //③ 初始化优化变量（初值）
-    gcopter::backwardMapTToTau(opt_vars.times, tau);
+    backwardMapBoundedTToTau(opt_vars.times, tau);
     switch (opt_vars.pos_constraint_type) {
         case 1: {
             MatDf p_e = opt_vars.points;
@@ -853,7 +998,7 @@ double ExpTrajOpt::optimize(Trajectory &traj, const double &relCostTol) {
                                     lbfgs_params);
     // double dt = ttt.stop();
     //⑦ 解包优化结果
-    gcopter::forwardMapTauToT(tau, opt_vars.times);
+    forwardMapTauToBoundedT(tau, opt_vars.times);
     if (cfg_.print_optimizer_log) {
         cout << " -- [ExpOpt] Opt finish, with iter num: " << opt_vars.iter_num << "\n";
         cout << "\tEnergy: " << opt_vars.penalty_log(0) << endl;
@@ -868,11 +1013,14 @@ double ExpTrajOpt::optimize(Trajectory &traj, const double &relCostTol) {
     }
     //检查加速度、角速度、推力、位置等是否超出限制。
     //若违反约束，虽然优化过程成功，逻辑上也认为失败。
+    const double acc_violation_tol = squaredBoundViolationTolerance(cfg_.max_acc, cfg_.penna_margin);
+    const double omg_violation_tol = squaredBoundViolationTolerance(cfg_.max_omg, cfg_.penna_margin);
+    const double thr_violation_tol = thrustViolationTolerance(cfg_);
     if ((cfg_.penna_pos > 0 && opt_vars.penalty_log(1) > 0.2) ||
         // (cfg_.penna_vel > 0 && opt_vars.penalty_log(2) > cfg_.max_vel * cfg_.penna_margin) ||
-        (cfg_.penna_acc > 0 && opt_vars.penalty_log(3) > cfg_.max_acc * cfg_.penna_margin) ||
-        (cfg_.penna_omg > 0 && opt_vars.penalty_log(6) > cfg_.max_omg * cfg_.penna_margin) ||
-        (cfg_.penna_thr > 0 && opt_vars.penalty_log(7) > cfg_.max_acc * cfg_.penna_margin)) {
+        (cfg_.penna_acc > 0 && opt_vars.penalty_log(3) > acc_violation_tol) ||
+        (cfg_.penna_omg > 0 && opt_vars.penalty_log(6) > omg_violation_tol) ||
+        (cfg_.penna_thr > 0 && opt_vars.penalty_log(7) > thr_violation_tol)) {
         if (cfg_.print_optimizer_log) {
             cout << " -- [ExpOpt] Opt finish, with iter num: " << opt_vars.iter_num << "\n";
             cout << "\tEnergy: " << opt_vars.penalty_log(0) << endl;
@@ -885,12 +1033,19 @@ double ExpTrajOpt::optimize(Trajectory &traj, const double &relCostTol) {
             cout << "\tThr: " << opt_vars.penalty_log(7) << endl;
             cout << "\tOptimized Time: " << opt_vars.times.transpose() << endl;
         }
-        ros_ptr_->warn(" -- [ExpOpt] Opt failed, Omg or thr or Pos violation.");
+        ros_ptr_->warn(" -- [ExpOpt] Opt failed, Pos/Acc/Omg/Thr violation. "
+                       "pos={:.6f}, acc={:.6f}/{:.6f}, omg={:.6f}/{:.6f}, "
+                       "thr={:.6f}/{:.6f}, time_sum={:.6f}",
+                       opt_vars.penalty_log(1),
+                       opt_vars.penalty_log(3), acc_violation_tol,
+                       opt_vars.penalty_log(6), omg_violation_tol,
+                       opt_vars.penalty_log(7), thr_violation_tol,
+                       opt_vars.times.sum());
         ret = -1;
     }
 
     if (ret >= 0) {
-        gcopter::forwardMapTauToT(tau, opt_vars.times);
+        forwardMapTauToBoundedT(tau, opt_vars.times);
         switch (opt_vars.pos_constraint_type) {
             case 1: {
                 VecDf xi_e = xi;
@@ -1033,8 +1188,16 @@ bool ExpTrajOpt::optimize(const StatePVAJ &headPVAJ, const StatePVAJ &tailPVAJ,
                           PolytopeVec &sfcs,
                           Trajectory &out_traj) {
     static const std::vector<MatD4f> empty_dynamic_hplanes;
+    return optimize(headPVAJ, tailPVAJ, guide_path, guide_t, sfcs, empty_dynamic_hplanes, out_traj);
+}
+
+bool ExpTrajOpt::optimize(const StatePVAJ &headPVAJ, const StatePVAJ &tailPVAJ,
+                          const vec_E<Vec3f> &guide_path, const vector<double> &guide_t,
+                          PolytopeVec &sfcs,
+                          const std::vector<MatD4f> &dynamic_hplanes,
+                          Trajectory &out_traj) {
     static const vector<SwarmPrediction> empty_swarm_predictions;
-    return optimize(headPVAJ, tailPVAJ, guide_path, guide_t, sfcs, empty_dynamic_hplanes,
+    return optimize(headPVAJ, tailPVAJ, guide_path, guide_t, sfcs, dynamic_hplanes,
                     empty_swarm_predictions, ros_ptr_->getSimTime(), out_traj);
 }
 
@@ -1047,9 +1210,8 @@ bool ExpTrajOpt::optimize(const StatePVAJ &headPVAJ, const StatePVAJ &tailPVAJ,
                           Trajectory &out_traj) {
     /// Check if hot init is valid 检查输入是否合法
     //引导路径的点数要和时间戳长度一致，否则无法确定轨迹采样点。
-    if (guide_path.size() != guide_t.size()) {
-        cout << YELLOW << " -- [TrajOpt] Error, the guide trajectory has wrong path and time stamp." << RESET
-             << endl;
+    if (!headPVAJ.allFinite() || !tailPVAJ.allFinite() || !finiteGuide(guide_path, guide_t)) {
+        cout << YELLOW << " -- [TrajOpt] Error, invalid state or guide trajectory." << RESET << endl;
         return false;
     }
     /// Check if SFC is valid
@@ -1058,17 +1220,28 @@ bool ExpTrajOpt::optimize(const StatePVAJ &headPVAJ, const StatePVAJ &tailPVAJ,
         return false;
     }
 
-    for (size_t i = 0; i < sfcs.size() && i < dynamic_hplanes.size(); ++i) {
-        MatD4f merged_planes;
-        if (!mergeDynamicPlanes(sfcs[i].GetPlanes(), dynamic_hplanes[i], merged_planes)) continue;
-        Vec3f interior;
-        if (geometry_utils::findInterior(merged_planes, interior)) sfcs[i].SetPlanes(merged_planes);
+    PolytopeVec opt_sfcs = sfcs;
+    if (!dynamic_hplanes.empty()) {
+        for (long i = 0; i < static_cast<long>(opt_sfcs.size()); ++i) {
+            if (i >= static_cast<long>(dynamic_hplanes.size())) {
+                continue;
+            }
+            MatD4f merged_planes;
+            if (!mergeFiniteDynamicPlanes(opt_sfcs[i].GetPlanes(), dynamic_hplanes[i], merged_planes)) {
+                continue;
+            }
+            Vec3f interior;
+            if (geometry_utils::findInterior(merged_planes, interior)) {
+                opt_sfcs[i].SetPlanes(merged_planes);
+            }
+        }
     }
 
-    if (!SimplifySFC(headPVAJ.col(0), tailPVAJ.col(0), sfcs)) {//简化 SFC（可选压缩、合并等）
+    if (!SimplifySFC(headPVAJ.col(0), tailPVAJ.col(0), opt_sfcs)) {//简化 SFC（可选压缩、合并等）
         cout << YELLOW << " -- [TrajOpt] Cannot simplify sfcs." << RESET << endl;
         return false;
     }
+    sfcs = opt_sfcs;
 
     bool success{true};
 
@@ -1087,7 +1260,16 @@ bool ExpTrajOpt::optimize(const StatePVAJ &headPVAJ, const StatePVAJ &tailPVAJ,
 
     for (long i = 0; i < sfcs.size(); i++) {
         opt_vars.hPolytopes[i] = sfcs[i].GetPlanes();
+        if (opt_vars.hPolytopes[i].cols() != 4 || opt_vars.hPolytopes[i].rows() <= 0 ||
+            !opt_vars.hPolytopes[i].allFinite()) {
+            cout << YELLOW << " -- [TrajOpt] Error, invalid SFC planes." << RESET << endl;
+            return false;
+        }
         const Eigen::ArrayXd norms = opt_vars.hPolytopes[i].leftCols<3>().rowwise().norm();
+        if ((norms <= 1.0e-6).any() || (!norms.isFinite()).any()) {
+            cout << YELLOW << " -- [TrajOpt] Error, degenerate SFC plane normal." << RESET << endl;
+            return false;
+        }
         opt_vars.hPolytopes[i].array().colwise() /= norms;
     }
 
@@ -1099,7 +1281,43 @@ bool ExpTrajOpt::optimize(const StatePVAJ &headPVAJ, const StatePVAJ &tailPVAJ,
     out_traj.clear();
 
     //调用轨迹优化求解器
-    if (success && std::isinf(optimize(out_traj, cfg_.opt_accuracy))) {
+    double opt_cost = success ? optimize(out_traj, cfg_.opt_accuracy) : INFINITY;
+    if (success && !std::isfinite(opt_cost)) {
+        const VecDf base_init_ts = opt_vars.init_ts;
+        const vec_Vec3f base_init_ps = opt_vars.init_ps;
+        const VecDf base_penalty_weights = opt_vars.penaltyWeights;
+        const double base_rho = opt_vars.rho;
+        const bool base_given_init = opt_vars.given_init_ts_and_ps;
+
+        const std::array<std::tuple<double, double, double>, 2> retry_settings = {
+                std::make_tuple(1.20, 3.0, 0.80),
+                std::make_tuple(1.50, 6.0, 0.60)
+        };
+        for (const auto &[time_scale, constraint_scale, rho_scale]: retry_settings) {
+            if (base_init_ts.size() != opt_vars.piece_num ||
+                static_cast<int>(base_init_ps.size()) != opt_vars.piece_num - 1) {
+                break;
+            }
+            opt_vars.given_init_ts_and_ps = true;
+            opt_vars.init_ts = (base_init_ts * time_scale).cwiseMax(kMinStablePieceTime);
+            opt_vars.init_ps = base_init_ps;
+            opt_vars.penaltyWeights = base_penalty_weights;
+            opt_vars.penaltyWeights(0) *= constraint_scale;
+            opt_vars.penaltyWeights(5) *= constraint_scale;
+            opt_vars.rho = base_rho * rho_scale;
+            out_traj.clear();
+            ros_ptr_->warn(" -- [ExpOpt] Retry with init_time_scale={:.2f}, constraint_scale={:.2f}, rho_scale={:.2f}",
+                           time_scale, constraint_scale, rho_scale);
+            opt_cost = optimize(out_traj, cfg_.opt_accuracy);
+            if (std::isfinite(opt_cost)) {
+                break;
+            }
+        }
+        opt_vars.penaltyWeights = base_penalty_weights;
+        opt_vars.rho = base_rho;
+        opt_vars.given_init_ts_and_ps = base_given_init;
+    }
+    if (success && !std::isfinite(opt_cost)) {
         cout << YELLOW << " -- [SUPER] Minco exp_traj opt failed." << RESET << endl;
         success = false;
     }
@@ -1149,9 +1367,8 @@ bool ExpTrajOpt::optimize(const StatePVAJ &headPVAJ, const StatePVAJ &tailPVAJ,
         guide_t.emplace_back(accumulate_t);
     }
     /// Check if hot init is valid
-    if (guide_path.size() != guide_t.size()) {
-        cout << YELLOW << " -- [TrajOpt] Error, the guide trajectory has wrong path and time stamp." << RESET
-             << endl;
+    if (!headPVAJ.allFinite() || !tailPVAJ.allFinite() || !init_ts.allFinite() || !finiteGuide(guide_path, guide_t)) {
+        cout << YELLOW << " -- [TrajOpt] Error, invalid state or guide trajectory." << RESET << endl;
         return false;
     }
     /// Check if SFC is valid
@@ -1176,11 +1393,22 @@ bool ExpTrajOpt::optimize(const StatePVAJ &headPVAJ, const StatePVAJ &tailPVAJ,
     opt_vars.tailPVAJ = tailPVAJ;
     opt_vars.guide_path = guide_path;
     opt_vars.guide_t = guide_t;
+    opt_vars.swarm_predictions.clear();
+    opt_vars.trajectory_start_wt = ros_ptr_->getSimTime();
     opt_vars.hPolytopes.resize(sfcs.size());
 
     for (long i = 0; i < sfcs.size(); i++) {
         opt_vars.hPolytopes[i] = sfcs[i].GetPlanes();
+        if (opt_vars.hPolytopes[i].cols() != 4 || opt_vars.hPolytopes[i].rows() <= 0 ||
+            !opt_vars.hPolytopes[i].allFinite()) {
+            cout << YELLOW << " -- [TrajOpt] Error, invalid SFC planes." << RESET << endl;
+            return false;
+        }
         const Eigen::ArrayXd norms = opt_vars.hPolytopes[i].leftCols<3>().rowwise().norm();
+        if ((norms <= 1.0e-6).any() || (!norms.isFinite()).any()) {
+            cout << YELLOW << " -- [TrajOpt] Error, degenerate SFC plane normal." << RESET << endl;
+            return false;
+        }
         opt_vars.hPolytopes[i].array().colwise() /= norms;
     }
 
@@ -1191,7 +1419,8 @@ bool ExpTrajOpt::optimize(const StatePVAJ &headPVAJ, const StatePVAJ &tailPVAJ,
 
     out_traj.clear();
 
-    if (success && std::isinf(optimize(out_traj, cfg_.opt_accuracy))) {
+    const double opt_cost = success ? optimize(out_traj, cfg_.opt_accuracy) : INFINITY;
+    if (success && !std::isfinite(opt_cost)) {
         cout << YELLOW << " -- [SUPER] Minco exp_traj opt failed." << RESET << endl;
         success = false;
     }

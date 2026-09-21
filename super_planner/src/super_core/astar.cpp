@@ -237,6 +237,7 @@ namespace path_search {
         if (setup_ret != SUCCESS) {
             return setup_ret;
         }
+        const double effective_time_out = time_out > 0.0 ? time_out : cfg_.time_out;
         out_path.clear();
         double time_1 = ros_ptr_->getSimTime();
         ++rounds_;
@@ -245,6 +246,7 @@ namespace path_search {
         rog_map::Vec3f hit_pt;
         rog_map::Vec3f local_start_pt, local_end_pt;
         bool start_pt_out_local_map = false;
+        bool end_pt_out_local_map = false;
 
         local_start_pt = start_pt;
         local_end_pt = end_pt;
@@ -274,6 +276,7 @@ namespace path_search {
         }
 
         if (!insideLocalMap(end_pt)) {
+            end_pt_out_local_map = true;
             rog_map::Vec3f seed_pt = start_pt_out_local_map ? md_.local_map_center_d : start_pt;
             if (rog_map::lineIntersectBox(end_pt, seed_pt, md_.local_map_min_d, md_.local_map_max_d,
                                           hit_pt)) {
@@ -386,7 +389,7 @@ namespace path_search {
                     node_path.push_back(temp_ptr);
                 }
                 ConvertNodePathToPointPath(node_path, out_path);
-                return REACH_GOAL;
+                return end_pt_out_local_map ? REACH_HORIZON : REACH_GOAL;
             }
 
             // Distance terminate condition
@@ -503,16 +506,17 @@ namespace path_search {
                             neighborPtr->distance_to_goal = heu_score;
                             neighborPtr->total_score = distance_score + heu_score;
                         }
-                    }
+            }
             double time_2 = ros_ptr_->getSimTime();
-            if (!cfg_.visual_process && (time_2 - time_1) > time_out) {
+            if (!cfg_.visual_process && (time_2 - time_1) > effective_time_out) {
                 fmt::print(fg(fmt::color::indian_red),
-                           "Failed in A star path searching !!! {} seconds time limit exceeded.\n", time_out);
+                           "Failed in A star path searching !!! {} seconds time limit exceeded.\n",
+                           effective_time_out);
                 return TIME_OUT;
             }
         }
         double time_2 = ros_ptr_->getSimTime();
-        if ((time_2 - time_1) > time_out) {
+        if ((time_2 - time_1) > effective_time_out) {
             fmt::print(fg(fmt::color::indian_red), "Time consume in A star path finding is {} s, iter={}.\n",
                        (time_2 - time_1),
                        num_iter);

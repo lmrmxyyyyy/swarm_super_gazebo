@@ -58,7 +58,6 @@ namespace traj_opt {
         bool sample(const double query_wt, Vec3f &position, Vec3f &velocity) const;
     };
 
-
     class ExpTrajOpt {
         traj_opt::Config cfg_;
         std::ofstream failed_traj_log;
@@ -283,7 +282,7 @@ namespace traj_opt {
             if (opt_vars.default_init) {
                 defaultInitialization();
             } else {
-                opt_vars.times *= 0.8;
+                opt_vars.times = opt_vars.times.cwiseMax(0.05);
             }
 
             if (std::isnan(opt_vars.times.sum())) {
@@ -360,6 +359,12 @@ namespace traj_opt {
         bool optimize(const StatePVAJ &headPVAJ, const StatePVAJ &tailPVAJ,
                       const vec_E<Vec3f> &guide_path, const vector<double> &guide_t,
                       PolytopeVec &sfcs,
+                      Trajectory &out_traj);
+
+        bool optimize(const StatePVAJ &headPVAJ, const StatePVAJ &tailPVAJ,
+                      const vec_E<Vec3f> &guide_path, const vector<double> &guide_t,
+                      PolytopeVec &sfcs,
+                      const std::vector<MatD4f> &dynamic_hplanes,
                       Trajectory &out_traj);
 
         bool optimize(const StatePVAJ &headPVAJ, const StatePVAJ &tailPVAJ,

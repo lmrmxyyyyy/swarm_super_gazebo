@@ -71,7 +71,7 @@ namespace math_utils{
              *  This parameter controls the number of function and gradients evaluations
              *  per iteration for the line search routine. The default value is 64.
              */
-            int max_linesearch = 64;
+            int max_linesearch = 128;
 
             /**
              * The minimum step of the line search routine.

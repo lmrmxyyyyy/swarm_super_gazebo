@@ -44,6 +44,7 @@ namespace path_search {
         bool debug_visualization_en;
         bool allow_diag{false};
         int heu_type{0};
+        double time_out{0.1};
 
         PathSearchConfig() {};
 
@@ -55,6 +56,7 @@ namespace path_search {
             loader.LoadParam(name_space + "/debug_visualization_en", debug_visualization_en, false);  //开启debug可视化
             loader.LoadParam(name_space + "/heu_type", heu_type, 0);  //启发式函数种类   0 DIAG; 1 MANHATTAN; 2 EUCLIDEAN
             loader.LoadParam(name_space + "/visual_process", visual_process, false);  //#可视化
+            loader.LoadParam(name_space + "/time_out", time_out, 0.1);
             map_voxel_num = Vec3i(vox_[0], vox_[1], vox_[2]);
             map_size_i = map_voxel_num / 2;
             map_voxel_num = map_size_i * 2 + Vec3i::Constant(1);  //确保map_voxel_num 三维是奇数

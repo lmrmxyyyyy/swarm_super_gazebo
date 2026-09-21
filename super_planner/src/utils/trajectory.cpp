@@ -22,6 +22,7 @@
 */
 
 #include <data_structure/base/trajectory.h>
+#include <cmath>
 
 using namespace geometry_utils;
 using namespace super_utils;
@@ -156,8 +157,8 @@ Mat3Df Trajectory::getState(double t) const {
 }
 
 bool Trajectory::getState(double t, StatePVAJ& out_state) const {
-    const double & dur = getTotalDuration();
-    if (t < 0) {
+    const double dur = getTotalDuration();
+    if (empty() || t < 0 || !std::isfinite(dur) || dur <= 1e-6) {
         return false;
     }
     t = t > dur ? dur : t;

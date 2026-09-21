@@ -11,29 +11,38 @@ fsm:
   
 
 super_planner:
-  backup_traj_en: false    #开启备份轨迹  #nouse
+  backup_traj_en: true
+  backup_traj_risk_gate_en: true
+  backup_traj_trigger_clearance: 0.3
+  backup_traj_trigger_lookahead_time: 3.0
   detailed_log_en: false  #详细log
   visualization_en: false #//开启可视化（改为false以降低CPU负担）
-  use_fov_cut: true  #裁减fov？（改为true以加速处理）
+  use_fov_cut: false
   print_log: false  #//打印log
   visual_process: false  #//可视化处理
   frontend_in_known_free: false  #前端在未知边界内？
-  goal_yaw_en: true   #//目标yaw开启
+  use_dstar_lite_frontend: true
+  tracking_drift_recovery_en: true
+  goal_yaw_en: false
   goal_vel_en: false  #//目标速度开启
-  corridor_bound_dis: 1.0  #//走廊边界长度（初始化正方体）
-  corridor_line_max_length: 1.0   #//走廊线最大长度（改大以减少重规划）
-  safe_corridor_line_max_length: 3.0 #//安全走廊线最大长度（改大）
-  iris_iter_num: 1  #//iris迭代次数（改为1以加速）
-  obs_skip_num: 1  #障碍物躲避数量（改为1以加速）
-  replan_forward_dt: 0.3  #重规划向前时间（改大以减少频繁重规划）
+  corridor_bound_dis: 3.0
+  corridor_line_max_length: 15.0
+  safe_corridor_line_max_length: 15.0
+  iris_iter_num: 2
+  obs_skip_num: 2
+  replan_forward_dt: 0.2
+  max_replan_time: 4.0
   planning_horizon: 8.0  #规划界限（改大）
   sensing_horizon: -1  #感知界限
-  receding_dis: 3.0 #//后退距离（改大）
-  robot_r: 0.15  #机器人半径（改大以更保守）
+  receding_dis: 1.0
+  robot_r: 0.18
   yaw_dot_max: 0.8 #//最大yaw角速度（改大）
   # Yaw mode: 1 heading to velocity, 2 heading to goal
   yaw_mode: 1
   mpc_horizon: 15 #mpc步数
+  planning_period: 0.1
+  sync_tolerance: 0.02
+  max_traj_age_ms: 150.0
 
 
 traj_opt:  #轨迹优化参数
@@ -46,7 +55,7 @@ traj_opt:  #轨迹优化参数
     max_acc: 0.8
     max_jerk: 20.0
     max_omg: 1.0
-    max_acc_thr: 2.0
+    max_acc_thr: 15.0
     min_acc_thr: 0.1
     penna_margin: 0.05
 
@@ -55,9 +64,9 @@ traj_opt:  #轨迹优化参数
     pos_constraint_type: 1  #//位置约束类型
     energy_cost_type: 4
     block_energy_cost: false
-    opt_accuracy: 5.0e-6  #//相对优化终止容差。
+    opt_accuracy: 1.0e-4
     scale_factor: 1.0
-    integral_reso: 15
+    integral_reso: 24
     smooth_eps: 0.01
     local_density_en: true
     local_density_radius_x: 0.75
@@ -66,8 +75,8 @@ traj_opt:  #轨迹优化参数
     local_density_smooth_eps: 0.08
     local_density_time_inflation: 0.1
     local_density_weight: 1.0e+5
-    penna_t: 1200.0
-    penna_pos: 5.0e+5
+    penna_t: 1600.0
+    penna_pos: 1.0e+7
     penna_vel: 5.0e+4
     penna_acc: 5.0e+4
     penna_jerk: -5.0e+4
@@ -75,13 +84,14 @@ traj_opt:  #轨迹优化参数
     penna_omg:  5.0e+5
     penna_max_acc_thr:  5.0e+4
     penna_min_acc_thr:  5.0e+4
+    penna_thr: 5.0e+4
 
   backup_traj:
-    pos_constraint_type: 1
+    pos_constraint_type: 2
     piece_num: 2
     energy_cost_type: 4
-    block_energy_cost: true
-    opt_accuracy: 1.0e-6
+    block_energy_cost: false
+    opt_accuracy: 1.0e-5
     scale_factor: 1.0
     integral_reso: 12
     smooth_eps: 0.01
@@ -96,8 +106,16 @@ traj_opt:  #轨迹优化参数
     trigger_static_clearance: 0.8
     trigger_static_weight: 1.0
     trigger_swarm_weight: 1.0
-    penna_t: 1200.0
-    penna_ts: 1.0e+5
+    penna_t: 1600.0
+    penna_ts: 1.2e+5
+    ts_delay_weight: 3.0e+5
+    ts_delay_high_order_weight: 1.0e+6
+    ts_delay_deadband: 0.05
+    ts_anchor_weight: 5.0e+4
+    ts_anchor_deadband: 0.2
+    tail_anchor_weight: 2.0e+5
+    tail_anchor_deadband: 0.1
+    time_balance_weight: 2.0e+3
     penna_pos: 1.0e+6
     penna_vel: 1.0e+5
     penna_acc: 1.0e+5
@@ -116,7 +134,8 @@ traj_opt:  #轨迹优化参数
 
 
 astar:
-  map_voxel_num: [ 500, 500, 100 ]  #地图体素数量
+  map_voxel_num: [ 120, 120, 50 ]
+  time_out: 1.0
   visual_process: false  #可视化
   allow_diag: true  #允许对角线搜索路径
   # 0 DIAG; 1 MANHATTAN; 2 EUCLIDEAN

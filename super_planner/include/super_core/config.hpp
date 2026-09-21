@@ -51,6 +51,9 @@ namespace super_planner {
         bool goal_vel_en,goal_yaw_en;
         bool visual_process;
         bool frontend_in_known_free;
+        bool use_dstar_lite_frontend{true};
+        bool tracking_drift_recovery_en{true};
+        bool backup_traj_risk_gate_en{false};
 
         double resolution;
         double planning_horizon;
@@ -63,8 +66,11 @@ namespace super_planner {
         int obs_skip_num;
         double corridor_bound_dis, corridor_line_max_length;
         double replan_forward_dt;
+        double max_replan_time;
         double sample_traj_dt;
         double robot_r;
+        double backup_traj_trigger_clearance{0.0};
+        double backup_traj_trigger_lookahead_time{0.0};
         int iris_iter_num;
 
         int mpc_horizon{};
@@ -90,15 +96,23 @@ namespace super_planner {
             loader.LoadParam("super_planner/visual_process", visual_process, false);  //可视化处理
             loader.LoadParam("super_planner/use_fov_cut", use_fov_cut, false);  //#裁减fov？
             loader.LoadParam("super_planner/frontend_in_known_free", frontend_in_known_free, false);//#前端在未知边界内？
+            loader.LoadParam("super_planner/use_dstar_lite_frontend", use_dstar_lite_frontend, true);
+            loader.LoadParam("super_planner/tracking_drift_recovery_en", tracking_drift_recovery_en, true);
+            loader.LoadParam("super_planner/backup_traj_risk_gate_en", backup_traj_risk_gate_en, false);
             loader.LoadParam("super_planner/safe_corridor_line_max_length", safe_corridor_line_max_length, 3.0);//安全走廊线最大长度
             loader.LoadParam("super_planner/sensing_horizon", sensing_horizon, 3.0);//#感知界限
             loader.LoadParam("super_planner/obs_skip_num", obs_skip_num, 1); //#障碍物躲避数量？
             loader.LoadParam("super_planner/replan_forward_dt", replan_forward_dt, 0.3);//#重规划向前时间
+            loader.LoadParam("super_planner/max_replan_time", max_replan_time, std::max(1.0, replan_forward_dt));
             loader.LoadParam("super_planner/corridor_bound_dis", corridor_bound_dis, 3.0);  //走廊边界距离
             loader.LoadParam("super_planner/corridor_line_max_length", corridor_line_max_length, 3.0); //走廊线最大长度
             loader.LoadParam("super_planner/planning_horizon", planning_horizon, 10.0);   //#规划界限
             loader.LoadParam("super_planner/receding_dis", receding_dis, 5.0);  //后退距离
             loader.LoadParam("super_planner/robot_r", robot_r, 0.3);  //#机器人半径
+            loader.LoadParam("super_planner/backup_traj_trigger_clearance", backup_traj_trigger_clearance,
+                             std::max(0.0, robot_r));
+            loader.LoadParam("super_planner/backup_traj_trigger_lookahead_time",
+                             backup_traj_trigger_lookahead_time, 0.0);
             loader.LoadParam("super_planner/iris_iter_num", iris_iter_num, 1);  //iris迭代次数
             loader.LoadParam("super_planner/yaw_mode", yaw_mode, 1);  //# Yaw mode: 1 heading to velocity, 2 heading to goal
             loader.LoadParam("super_planner/mpc_horizon", mpc_horizon, 1);  //#mpc步数

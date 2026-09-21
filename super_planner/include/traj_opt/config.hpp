@@ -79,6 +79,14 @@ namespace traj_opt {
         double trigger_static_clearance{0.8};
         double trigger_static_weight{1.0};
         double trigger_swarm_weight{1.0};
+        double ts_delay_weight{0.0};
+        double ts_delay_high_order_weight{0.0};
+        double ts_delay_deadband{0.0};
+        double ts_anchor_weight{0.0};
+        double ts_anchor_deadband{0.0};
+        double tail_anchor_weight{0.0};
+        double tail_anchor_deadband{0.0};
+        double time_balance_weight{0.0};
 
         Config() = default;
 
@@ -118,6 +126,14 @@ namespace traj_opt {
             loader.LoadParam("traj_opt" + ns + "trigger_static_clearance", trigger_static_clearance, 0.8);
             loader.LoadParam("traj_opt" + ns + "trigger_static_weight", trigger_static_weight, 1.0);
             loader.LoadParam("traj_opt" + ns + "trigger_swarm_weight", trigger_swarm_weight, 1.0);
+            loader.LoadParam("traj_opt" + ns + "ts_delay_weight", ts_delay_weight, 0.0);
+            loader.LoadParam("traj_opt" + ns + "ts_delay_high_order_weight", ts_delay_high_order_weight, 0.0);
+            loader.LoadParam("traj_opt" + ns + "ts_delay_deadband", ts_delay_deadband, 0.0);
+            loader.LoadParam("traj_opt" + ns + "ts_anchor_weight", ts_anchor_weight, 0.0);
+            loader.LoadParam("traj_opt" + ns + "ts_anchor_deadband", ts_anchor_deadband, 0.0);
+            loader.LoadParam("traj_opt" + ns + "tail_anchor_weight", tail_anchor_weight, 0.0);
+            loader.LoadParam("traj_opt" + ns + "tail_anchor_deadband", tail_anchor_deadband, 0.0);
+            loader.LoadParam("traj_opt" + ns + "time_balance_weight", time_balance_weight, 0.0);
             loader.LoadParam("traj_opt/boundary/max_vel", max_vel, -1.0);///边界参数
             loader.LoadParam("traj_opt/boundary/max_acc", max_acc, -1.0);
             loader.LoadParam("traj_opt/boundary/max_jerk", max_jerk, -1.0);

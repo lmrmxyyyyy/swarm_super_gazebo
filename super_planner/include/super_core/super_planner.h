@@ -41,6 +41,7 @@
 #include "traj_opt/exp_traj_optimizer_s4.h"
 #include "traj_opt/backup_traj_optimizer_s4.h"
 #include "path_search/astar.h"
+#include "path_search/dstar_lite.h"
 #include "rog_map/rog_map.h"
 #include "super_core/corridor_generator.h"
 #include "super_core/fov_checker.h"
@@ -68,6 +69,7 @@ namespace super_planner {
         rog_map::ROGMapROS::Ptr map_ptr_;
         CorridorGenerator::Ptr cg_ptr_;
         path_search::Astar::Ptr astar_ptr_;
+        path_search::DStarLite::Ptr dstar_lite_ptr_;
         ros_interface::RosInterface::Ptr ros_ptr_;
         Vec3f shifted_sfc_start_pt_;
 
@@ -102,6 +104,9 @@ namespace super_planner {
         CmdTraj cmd_traj_info_;
         ExpTraj last_exp_traj_info_;
 
+        int consecutive_exp_replan_fail_count_{0};
+        int max_consecutive_exp_replan_failures_{5};
+
         vector<double> time_consuming_;
 
         struct MpcPredictionCache {
@@ -117,6 +122,11 @@ namespace super_planner {
         double dynamic_collision_clearance_{0.3};
         double dynamic_collision_stale_time_{0.5};
         double dynamic_collision_sample_dt_{0.2};
+        double planning_period_{0.1};
+        double sync_tolerance_{0.02};
+        double max_traj_age_ms_{150.0};
+        // The MPC prediction topic uses the shared inertial frame while each
+        // planner and its obstacle map operate in the UAV's local frame.
         Vec3f inertial_origin_{0, 0, 0};
         double local_to_inertial_yaw_deg_{90.0};
         Mat3f local_to_inertial_R_{Mat3f::Identity()};

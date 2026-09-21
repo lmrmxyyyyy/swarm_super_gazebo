@@ -28,6 +28,7 @@
 #include <data_structure/exp_traj.h>
 #include <data_structure/backup_traj.h>
 #include <data_structure/base/trajectory.h>
+#include <cmath>
 
 
 namespace super_planner {
@@ -55,6 +56,15 @@ namespace super_planner {
         /* some flags */
         bool flag_empty_{true};
         bool flag_backup_traj_avilibale_{false};
+
+        bool validCommittedTrajectory(const Trajectory &pos_traj,
+                                      const Trajectory &yaw_traj) const {
+            const double pos_dur = pos_traj.getTotalDuration();
+            const double yaw_dur = yaw_traj.getTotalDuration();
+            return !pos_traj.empty() && !yaw_traj.empty() &&
+                   std::isfinite(pos_dur) && std::isfinite(yaw_dur) &&
+                   pos_dur > 1e-6 && yaw_dur > 1e-6;
+        }
 
         void checkFirstPartBackupTraj(const ExpTraj & exp) {
             double tmp_s, tmp_e;
@@ -99,6 +109,13 @@ namespace super_planner {
             }
             pos_traj_ = tmp_pos_traj + backup_traj.posTraj();
             yaw_traj_ = tmp_yaw_traj + backup_traj.yawTraj();
+            if (!validCommittedTrajectory(pos_traj_, yaw_traj_)) {
+                fmt::print(fg(fmt::color::indian_red),
+                           " -- [SUPER] reject invalid committed trajectory with backup.\n");
+                flag_empty_ = true;
+                flag_backup_traj_avilibale_ = false;
+                return false;
+            }
 
             start_WT_ = pos_traj_.start_WT;
 
@@ -108,15 +125,23 @@ namespace super_planner {
             return true;
         }
 
-        void setTrajectory(const ExpTraj&exp_traj) {
+        bool setTrajectory(const ExpTraj&exp_traj) {
             LOCK_G
             pos_traj_ = exp_traj.posTraj();
             yaw_traj_ = exp_traj.yawTraj();
+            if (!validCommittedTrajectory(pos_traj_, yaw_traj_)) {
+                fmt::print(fg(fmt::color::indian_red),
+                           " -- [SUPER] reject invalid committed trajectory without backup.\n");
+                flag_empty_ = true;
+                flag_backup_traj_avilibale_ = false;
+                return false;
+            }
             start_WT_ = pos_traj_.start_WT;
             flag_empty_ = false;
             backup_traj_start_TT_ = 99999999;
             flag_backup_traj_avilibale_ = false;
             checkFirstPartBackupTraj(exp_traj);
+            return true;
         }
 
         bool isTTOnBackupTraj(const double & checkTT) const {

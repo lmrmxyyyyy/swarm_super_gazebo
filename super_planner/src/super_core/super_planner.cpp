@@ -35,6 +35,189 @@
 using namespace super_utils;
 
 namespace super_planner {
+    namespace {
+        bool samePoint(const Vec3f &a, const Vec3f &b) {
+            return (a - b).squaredNorm() < 1.0e-8;
+        }
+
+        bool frontendLineFree(const Vec3f &from,
+                              const Vec3f &to,
+                              const rog_map::ROGMapROS::Ptr &map_ptr,
+                              const bool unknown_as_occupied) {
+            return map_ptr && map_ptr->isLineFree(from, to, true, unknown_as_occupied);
+        }
+
+        double cornerCost(const Vec3f &prev, const Vec3f &cur, const Vec3f &next) {
+            const Vec3f in = cur - prev;
+            const Vec3f out = next - cur;
+            const double in_norm = in.norm();
+            const double out_norm = out.norm();
+            if (in_norm < 1.0e-6 || out_norm < 1.0e-6) {
+                return 0.0;
+            }
+            const double cos_angle = std::max(-1.0, std::min(1.0, in.dot(out) / (in_norm * out_norm)));
+            return 1.0 - cos_angle;
+        }
+
+        void removeRedundantCorners(vec_Vec3f &path,
+                                    const rog_map::ROGMapROS::Ptr &map_ptr,
+                                    const bool unknown_as_occupied) {
+            if (path.size() <= 2 || !map_ptr) {
+                return;
+            }
+
+            constexpr double kNearlyStraightTurnCost = 0.035; // about 15 deg
+            constexpr double kShortSegmentLength = 0.35;
+            constexpr double kShortCornerTurnCost = 0.18; // about 35 deg
+
+            bool changed = true;
+            int pass = 0;
+            while (changed && pass++ < 3 && path.size() > 2) {
+                changed = false;
+                vec_Vec3f sparse;
+                sparse.reserve(path.size());
+                sparse.push_back(path.front());
+
+                for (size_t i = 1; i + 1 < path.size(); ++i) {
+                    const Vec3f &prev = sparse.back();
+                    const Vec3f &cur = path[i];
+                    const Vec3f &next = path[i + 1];
+                    const double in_len = (cur - prev).norm();
+                    const double out_len = (next - cur).norm();
+                    const double turn_cost = cornerCost(prev, cur, next);
+                    const bool weak_corner = turn_cost < kNearlyStraightTurnCost;
+                    const bool short_corner = std::min(in_len, out_len) < kShortSegmentLength &&
+                                              turn_cost < kShortCornerTurnCost;
+
+                    if ((weak_corner || short_corner) &&
+                        frontendLineFree(prev, next, map_ptr, unknown_as_occupied)) {
+                        changed = true;
+                        continue;
+                    }
+
+                    sparse.push_back(cur);
+                }
+
+                sparse.push_back(path.back());
+                path.swap(sparse);
+            }
+        }
+
+        void softenSharpCorners(vec_Vec3f &path,
+                                const rog_map::ROGMapROS::Ptr &map_ptr,
+                                const bool unknown_as_occupied) {
+            if (path.size() <= 2 || !map_ptr) {
+                return;
+            }
+
+            constexpr double kSharpTurnCost = 0.5; // about 60 deg
+            constexpr double kMinRoundSegment = 0.25;
+            constexpr double kMaxRoundSegment = 0.8;
+            constexpr double kRoundRatio = 0.35;
+
+            vec_Vec3f rounded;
+            rounded.reserve(path.size() * 2);
+            rounded.push_back(path.front());
+
+            for (size_t i = 1; i + 1 < path.size(); ++i) {
+                const Vec3f &prev = rounded.back();
+                const Vec3f &cur = path[i];
+                const Vec3f &next = path[i + 1];
+                const double in_len = (cur - prev).norm();
+                const double out_len = (next - cur).norm();
+                const double turn_cost = cornerCost(prev, cur, next);
+
+                if (turn_cost < kSharpTurnCost ||
+                    in_len < kMinRoundSegment * 2.0 ||
+                    out_len < kMinRoundSegment * 2.0) {
+                    rounded.push_back(cur);
+                    continue;
+                }
+
+                const double round_len = std::min(kMaxRoundSegment,
+                                                  std::max(kMinRoundSegment,
+                                                           kRoundRatio * std::min(in_len, out_len)));
+                const Vec3f entry = cur - (cur - prev).normalized() * round_len;
+                const Vec3f exit = cur + (next - cur).normalized() * round_len;
+
+                if (frontendLineFree(entry, exit, map_ptr, unknown_as_occupied) &&
+                    frontendLineFree(prev, entry, map_ptr, unknown_as_occupied) &&
+                    frontendLineFree(exit, next, map_ptr, unknown_as_occupied)) {
+                    if (!samePoint(rounded.back(), entry)) {
+                        rounded.push_back(entry);
+                    }
+                    if (!samePoint(rounded.back(), exit)) {
+                        rounded.push_back(exit);
+                    }
+                } else {
+                    rounded.push_back(cur);
+                }
+            }
+
+            rounded.push_back(path.back());
+            path.swap(rounded);
+        }
+
+        void greedyShortcutOnce(vec_Vec3f &path,
+                                const rog_map::ROGMapROS::Ptr &map_ptr,
+                                const bool unknown_as_occupied) {
+            if (path.size() <= 2 || !map_ptr) {
+                return;
+            }
+
+            vec_Vec3f shortcut;
+            shortcut.reserve(path.size());
+            shortcut.push_back(path.front());
+
+            size_t anchor = 0;
+            while (anchor + 1 < path.size()) {
+                size_t next = anchor + 1;
+                for (size_t candidate = path.size() - 1; candidate > anchor + 1; --candidate) {
+                    if (frontendLineFree(path[anchor], path[candidate], map_ptr, unknown_as_occupied)) {
+                        next = candidate;
+                        break;
+                    }
+                }
+
+                shortcut.push_back(path[next]);
+                anchor = next;
+            }
+
+            path.swap(shortcut);
+        }
+
+        void shortcutFrontendPath(vec_Vec3f &path,
+                                  const rog_map::ROGMapROS::Ptr &map_ptr,
+                                  const bool unknown_as_occupied) {
+            if (path.size() <= 2 || !map_ptr) {
+                return;
+            }
+
+            vec_Vec3f cleaned;
+            cleaned.reserve(path.size());
+            for (const auto &pt: path) {
+                if (cleaned.empty() || !samePoint(cleaned.back(), pt)) {
+                    cleaned.push_back(pt);
+                }
+            }
+            if (cleaned.size() <= 2) {
+                path.swap(cleaned);
+                return;
+            }
+
+            greedyShortcutOnce(cleaned, map_ptr, unknown_as_occupied);
+            std::reverse(cleaned.begin(), cleaned.end());
+            greedyShortcutOnce(cleaned, map_ptr, unknown_as_occupied);
+            std::reverse(cleaned.begin(), cleaned.end());
+            greedyShortcutOnce(cleaned, map_ptr, unknown_as_occupied);
+            removeRedundantCorners(cleaned, map_ptr, unknown_as_occupied);
+            softenSharpCorners(cleaned, map_ptr, unknown_as_occupied);
+            removeRedundantCorners(cleaned, map_ptr, unknown_as_occupied);
+
+            path.swap(cleaned);
+        }
+    }
+
     SuperPlanner::SuperPlanner
             (const std::string &cfg_path,
              const ros_interface::RosInterface::Ptr &ros_ptr,
@@ -48,6 +231,7 @@ namespace super_planner {
         yaw_traj_opt_ = std::make_shared<traj_opt::YawTrajOpt>(cfg_.yaw_dot_max);  //yaw角优化器
         const auto &rog_map_cfg = map_ptr_->getMapConfig();//获取rogmap参数
         astar_ptr_ = std::make_shared<path_search::Astar>(cfg_path, ros_ptr_, map_ptr_); //实例化a*地图
+        dstar_lite_ptr_ = std::make_shared<path_search::DStarLite>(cfg_path, ros_ptr_, map_ptr_); //实例化D* Lite地图
         cg_ptr_ = std::make_shared<CorridorGenerator>(ros_ptr_, map_ptr_, cfg_.corridor_bound_dis,  //实例化飞行走廊生成器
                                                       cfg_.corridor_line_max_length,
                                                       cfg_.resolution, rog_map_cfg.virtual_ground_height,
@@ -69,6 +253,7 @@ namespace super_planner {
 
         const int neighbor_step = floor(cfg_.robot_r / cfg_.resolution);  //a*邻居步数
         astar_ptr_->setFineInfNeighbors(neighbor_step);  //设置a*邻居步数
+        dstar_lite_ptr_->setFineInfNeighbors(neighbor_step);  //设置D* Lite邻居步数
 
         initializeDynamicCollisionAvoidance();
     }
@@ -86,11 +271,14 @@ namespace super_planner {
     void SuperPlanner::initializeDynamicCollisionAvoidance() {
         ros::NodeHandle pnh("~");
         pnh.param<std::string>("uav_name", uav_name_, uav_name_);
-        pnh.param("swarm_uav_num", swarm_uav_num_, 2);
+        pnh.param("swarm_uav_num", swarm_uav_num_, 4);
         pnh.param("dynamic_collision_en", dynamic_collision_en_, true);
         pnh.param("dynamic_collision_clearance", dynamic_collision_clearance_, std::max(0.3, cfg_.robot_r));
         pnh.param("dynamic_collision_stale_time", dynamic_collision_stale_time_, 0.5);
         pnh.param("dynamic_collision_sample_dt", dynamic_collision_sample_dt_, 0.2);
+        pnh.param("planning_period", planning_period_, 0.1);
+        pnh.param("sync_tolerance", sync_tolerance_, 0.02);
+        pnh.param("max_traj_age_ms", max_traj_age_ms_, 150.0);
         double inertial_origin_x = 0.0;
         double inertial_origin_y = 0.0;
         double inertial_origin_z = 0.0;
@@ -103,7 +291,6 @@ namespace super_planner {
         local_to_inertial_R_ << std::cos(yaw_rad), -std::sin(yaw_rad), 0.0,
                                 std::sin(yaw_rad),  std::cos(yaw_rad), 0.0,
                                 0.0,                0.0,               1.0;
-
         uav_id_ = parseUavId(uav_name_);
         if ((!dynamic_collision_en_ && !cfg_.exp_traj_cfg.local_density_en) || swarm_uav_num_ <= 1) {
             return;
@@ -124,7 +311,7 @@ namespace super_planner {
             other_mpc_predictions_[id] = MpcPredictionCache();
         }
 
-        ros_ptr_->info(" -- [SUPER] dynamic collision enabled for " + uav_name_ +
+        ros_ptr_->info(" -- [SUPER] swarm prediction enabled for " + uav_name_ +
                        ", subscribed to " + std::to_string(other_mpc_pred_subs_.size()) +
                        " other MPC prediction topics.");
     }
@@ -187,15 +374,16 @@ namespace super_planner {
     }
 
     void SuperPlanner::buildTimeAwareDynamicHyperplanes(const PolytopeVec &sfc,
-                                                         const vec_E<Vec3f> &guide_path,
-                                                         const vector<double> &guide_stamp,
-                                                         const double &sfc_start_wt,
-                                                         std::vector<MatD4f> &dynamic_hplanes) {
+                                                        const vec_E<Vec3f> &guide_path,
+                                                        const vector<double> &guide_stamp,
+                                                        const double &sfc_start_wt,
+                                                        std::vector<MatD4f> &dynamic_hplanes) {
         dynamic_hplanes.clear();
         dynamic_hplanes.resize(sfc.size());
         for (auto &planes: dynamic_hplanes) {
             planes.resize(0, 4);
         }
+
         if (!dynamic_collision_en_ || sfc.empty() || guide_path.empty() || guide_stamp.size() != guide_path.size()) {
             return;
         }
@@ -222,8 +410,7 @@ namespace super_planner {
             if (sfc_id < 0) {
                 continue;
             }
-            if (guide_stamp[k] - last_sample_t[sfc_id] < dynamic_collision_sample_dt_ &&
-                k + 1 < guide_path.size()) {
+            if (guide_stamp[k] - last_sample_t[sfc_id] < dynamic_collision_sample_dt_ && k + 1 < guide_path.size()) {
                 continue;
             }
             last_sample_t[sfc_id] = guide_stamp[k];
@@ -246,19 +433,28 @@ namespace super_planner {
                     continue;
                 }
                 const Vec3f nhypnorm = nhyp / dist;
-                const Vec3f r = nhypnorm.cross(Vec3f(0.0, 0.0, 1.0)) +
-                                nhypnorm.cross(Vec3f(0.0, 1.0, 0.0));
-                if (r.norm() > 1e-6) {
+                const Vec3f zw(0.0, 0.0, 1.0);
+                const Vec3f yw(0.0, 1.0, 0.0);
+                const Vec3f r = nhypnorm.cross(zw) + nhypnorm.cross(yw);
+                const double r_norm = r.norm();
+                if (r_norm > 1e-6) {
                     const double initial_goal_dist = (gi_.goal_p - guide_path.front()).norm();
                     double progress = 1.0;
                     if (initial_goal_dist > 1e-3) {
                         const double current_goal_dist = (gi_.goal_p - self_pos).norm();
-                        progress = std::max(0.0, std::min(1.0,
-                                   (initial_goal_dist - current_goal_dist) / initial_goal_dist));
+                        progress = (initial_goal_dist - current_goal_dist) / initial_goal_dist;
+                        progress = std::max(0.0, std::min(1.0, progress));
                     }
-                    nhyp += (0.1 + 0.05 * (1.0 - progress)) * r.normalized();
+                    const double c = 0.1;
+                    const double perturb_k = 0.05;
+                    const Vec3f npert = (c + perturb_k * (1.0 - progress)) * r / r_norm;
+                    nhyp += npert;
                 }
-                const Vec3f normal = nhyp.normalized();
+                const double nhyp_pert_norm = nhyp.norm();
+                Vec3f normal = nhypnorm;
+                if (nhyp_pert_norm > 1e-6) {
+                    normal = nhyp / nhyp_pert_norm;
+                }
                 const Vec3f mid = 0.5 * (self_pos_inertial + other_pos_inertial);
                 const double shift = 0.5 * std::min(2.0 * dynamic_collision_clearance_, dist);
                 const Vec3f plane_point_inertial = mid - shift * normal;
@@ -272,55 +468,69 @@ namespace super_planner {
                     candidate.middleRows(sfc[sfc_id].GetPlanes().rows(), dynamic_hplanes[sfc_id].rows()) =
                             dynamic_hplanes[sfc_id];
                 }
-                candidate.bottomRows(1) << normal_local.x(), normal_local.y(), normal_local.z(), plane_d_local;
+                const int new_row = candidate.rows();
+                candidate.row(new_row - 1) << normal_local.x(), normal_local.y(),
+                                               normal_local.z(), plane_d_local;
 
                 Vec3f interior;
                 if (geometry_utils::findInterior(candidate, interior)) {
-                    const int row = dynamic_hplanes[sfc_id].rows();
-                    dynamic_hplanes[sfc_id].conservativeResize(row + 1, 4);
-                    dynamic_hplanes[sfc_id].row(row) << normal_local.x(), normal_local.y(), normal_local.z(), plane_d_local;
+                    const int dyn_row = dynamic_hplanes[sfc_id].rows();
+                    dynamic_hplanes[sfc_id].conservativeResize(dyn_row + 1, 4);
+                    dynamic_hplanes[sfc_id].row(dyn_row) << normal_local.x(), normal_local.y(),
+                                                            normal_local.z(), plane_d_local;
                     ++added_planes;
                 }
             }
         }
 
         if (cfg_.print_log && added_planes > 0) {
-            ros_ptr_->info(" -- [SUPER] Added " + std::to_string(added_planes) +
+            ros_ptr_->info(" -- [SUPER] Built " + std::to_string(added_planes) +
                            " time-aware dynamic collision hyperplanes from MPC predictions.");
         }
     }
 
     void SuperPlanner::buildSwarmPredictions(std::vector<traj_opt::SwarmPrediction> &predictions) {
         predictions.clear();
-        if (!cfg_.exp_traj_cfg.local_density_en || swarm_uav_num_ <= 1) return;
+        if (!cfg_.exp_traj_cfg.local_density_en || swarm_uav_num_ <= 1) {
+            return;
+        }
 
         std::map<int, MpcPredictionCache> cached_predictions;
         {
             std::lock_guard<std::mutex> lock(other_mpc_pred_mutex_);
             cached_predictions = other_mpc_predictions_;
         }
+
         const double now_wt = ros::Time::now().toSec();
         for (const auto &item: cached_predictions) {
             const auto &cache = item.second;
             if (!cache.received || (now_wt - cache.rcv_stamp.toSec()) > dynamic_collision_stale_time_ ||
-                cache.traj.pos.empty()) continue;
+                cache.traj.pos.empty()) {
+                continue;
+            }
 
             traj_opt::SwarmPrediction prediction;
             prediction.start_wt = cache.traj.header.stamp.toSec();
+            prediction.positions.reserve(cache.traj.pos.size());
+            prediction.times.reserve(cache.traj.pos.size());
             const bool has_valid_times = cache.traj.time.size() == cache.traj.pos.size();
             double last_time = -std::numeric_limits<double>::infinity();
             for (size_t i = 0; i < cache.traj.pos.size(); ++i) {
                 const auto &point = cache.traj.pos[i];
                 const Vec3f inertial_position(point.x, point.y, point.z);
-                const Vec3f local_position = local_to_inertial_R_.transpose() *
-                                             (inertial_position - inertial_origin_);
-                const double sample_time = has_valid_times ? cache.traj.time[i] : 0.1 * i;
-                if (!local_position.allFinite() || !std::isfinite(sample_time) || sample_time < last_time) continue;
-                prediction.positions.push_back(local_position);
+                const Vec3f position = local_to_inertial_R_.transpose() *
+                                       (inertial_position - inertial_origin_);
+                const double sample_time = has_valid_times ? cache.traj.time[i] : 0.1 * static_cast<double>(i);
+                if (!position.allFinite() || !std::isfinite(sample_time) || sample_time < last_time) {
+                    continue;
+                }
+                prediction.positions.push_back(position);
                 prediction.times.push_back(sample_time);
                 last_time = sample_time;
             }
-            if (!prediction.positions.empty()) predictions.push_back(std::move(prediction));
+            if (!prediction.positions.empty()) {
+                predictions.push_back(std::move(prediction));
+            }
         }
     }
 
@@ -395,7 +605,10 @@ namespace super_planner {
                 ros_ptr_->info(" -- [SUPER] in [PlanFromRest] generateBackupTrajectory SUCCESS.");
             }
 
-            cmd_traj_info_.setTrajectory(exp_traj_info, back_traj_info); // 设置轨迹信息并更新轨迹
+            if (!cmd_traj_info_.setTrajectory(exp_traj_info, back_traj_info)) { // 设置轨迹信息并更新轨迹
+                ros_ptr_->warn(" -- [SUPER] in [PlanFromRest] reject invalid committed trajectory with backup.");
+                return FAILED;
+            }
             last_exp_traj_info_ = exp_traj_info; // 更新最后的扩展轨迹信息
             robot_on_backup_traj_ = false;  /// 标记机器人不在备用轨迹上
             gi_.new_goal = false;  //// 标记目标已处理
@@ -415,7 +628,10 @@ namespace super_planner {
                 ros_ptr_->info(" -- [SUPER] in [PlanFromRest] generateBackupTrajectory Finish or NO_NEED.");
             }
             robot_on_backup_traj_ = false;// 标记机器人不在备用轨迹上
-            cmd_traj_info_.setTrajectory(exp_traj_info);// 设置扩展轨迹
+            if (!cmd_traj_info_.setTrajectory(exp_traj_info)) {// 设置扩展轨迹
+                ros_ptr_->warn(" -- [SUPER] in [PlanFromRest] reject invalid committed trajectory without backup.");
+                return FAILED;
+            }
             last_exp_traj_info_ = exp_traj_info;
             gi_.new_goal = false;
 
@@ -458,6 +674,36 @@ namespace super_planner {
             time_consuming_[VISUALIZATION] += t_viz.stop();
         }
 
+        bool force_plan_from_actual = false;
+        double tracking_error = 0.0;
+        if (cfg_.tracking_drift_recovery_en && robot_state_.rcv && !last_exp_traj_info_.empty()) {
+            cmd_traj_info_.lock();
+            if (!cmd_traj_info_.empty() && !cmd_traj_info_.posTraj().empty()) {
+                const double total_dur = cmd_traj_info_.getTotalDuration();
+                if (total_dur > 1e-6 && std::isfinite(total_dur)) {
+                    double eval_t = ros_ptr_->getSimTime() - cmd_traj_info_.getStartWallTime();
+                    eval_t = std::max(0.0, std::min(eval_t, total_dur));
+                    const Vec3f ref_p = cmd_traj_info_.posTraj().getPos(eval_t);
+                    tracking_error = (robot_state_.p - ref_p).norm();
+                    force_plan_from_actual = tracking_error > std::max(1.0, cfg_.robot_r * 4.0);
+                }
+            }
+            cmd_traj_info_.unlock();
+        }
+
+        if (force_plan_from_actual) {
+            Vec3f local_start_pt;
+            if (!map_ptr_->getNearestCellNot(GridType::OCCUPIED, robot_state_.p, local_start_pt, 3.0)) {
+                ros_ptr_->warn(" -- [SUPER] in [ReplanOnce]: tracking drift {}, but no free restart point.",
+                               tracking_error);
+                return FAILED;
+            }
+            ros_ptr_->warn(" -- [SUPER] in [ReplanOnce]: tracking drift {} m, restart planning from actual state.",
+                           tracking_error);
+            last_exp_traj_info_.setEmpty();
+            local_start_p_ = local_start_pt;
+        }
+
 
         /// 1) Replan EXP traj
         //生成期望轨迹
@@ -467,9 +713,49 @@ namespace super_planner {
         time_consuming_[GENERATE_EXP_TRAJ] = t_exp.stop();
 
         if (exp_ret_code == FAILED) {
-            ros_ptr_->warn(" -- [SUPER] in [ReplanOnce]: GenerateExpTrajectory failed, force return");
-            return FAILED;
+            ++consecutive_exp_replan_fail_count_;
+            ros_ptr_->warn(" -- [SUPER] in [ReplanOnce]: GenerateExpTrajectory failed {}/{}.",
+                           consecutive_exp_replan_fail_count_,
+                           max_consecutive_exp_replan_failures_);
+
+            if (cfg_.tracking_drift_recovery_en &&
+                consecutive_exp_replan_fail_count_ > max_consecutive_exp_replan_failures_) {
+                Vec3f local_start_pt;
+                if (!robot_state_.rcv ||
+                    !map_ptr_->getNearestCellNot(GridType::OCCUPIED, robot_state_.p, local_start_pt, 3.0)) {
+                    ros_ptr_->warn(" -- [SUPER] in [ReplanOnce]: repeated exp failures, but no free restart point.");
+                    consecutive_exp_replan_fail_count_ = 0;
+                    return FAILED;
+                }
+
+                ros_ptr_->warn(
+                        " -- [SUPER] in [ReplanOnce]: repeated exp failures, restart planning from actual state.");
+                last_exp_traj_info_.setEmpty();
+                local_start_p_ = local_start_pt;
+
+                ExpTraj recovery_exp_traj_info;
+                TimeConsuming t_recovery_exp("t_recovery_exp", false);
+                exp_ret_code = generateExpTraj(last_exp_traj_info_, recovery_exp_traj_info);
+                time_consuming_[GENERATE_EXP_TRAJ] += t_recovery_exp.stop();
+                if (exp_ret_code == FAILED) {
+                    ros_ptr_->warn(" -- [SUPER] in [ReplanOnce]: recovery GenerateExpTrajectory failed, force return");
+                    consecutive_exp_replan_fail_count_ = 0;
+                    return FAILED;
+                } else if (exp_ret_code == NEW_TRAJ) {
+                    consecutive_exp_replan_fail_count_ = 0;
+                    return NEW_TRAJ;
+                } else if (exp_ret_code == EMER) {
+                    ros_ptr_->warn(" -- [SUPER] in [ReplanOnce]: recovery replan failed, switch to emer.");
+                    consecutive_exp_replan_fail_count_ = 0;
+                    return EMER;
+                }
+                exp_traj_info = recovery_exp_traj_info;
+                consecutive_exp_replan_fail_count_ = 0;
+            } else {
+                return FAILED;
+            }
         } else if (exp_ret_code == NEW_TRAJ) {
+            consecutive_exp_replan_fail_count_ = 0;
             if (cfg_.print_log) {
                 ros_ptr_->info(" -- [SUPER] in [ReplanOnce]: Last epx traj end, switch to new traj.");
             }
@@ -478,10 +764,12 @@ namespace super_planner {
             ros_ptr_->warn(" -- [SUPER] in [ReplanOnce]: Replan failed, switch to emer.");
             return EMER;
         } else if (exp_ret_code == SUCCESS) {
+            consecutive_exp_replan_fail_count_ = 0;
             if (cfg_.print_log) {
                 ros_ptr_->info(" -- [SUPER] in [ReplanOnce]: Replan a new exp traj success.");
             }
         } else if (exp_ret_code == NO_NEED) {
+            consecutive_exp_replan_fail_count_ = 0;
             if (cfg_.print_log)
                 ros_ptr_->info(" -- [SUPER] in [ReplanOnce]: No need to replan a new exp traj, use last one.");
         }
@@ -518,15 +806,19 @@ namespace super_planner {
         }
 
         double replan_dt = replan_total_t.stop();//检查重规划时间
-        if (replan_dt > cfg_.replan_forward_dt * 0.9) {
-            ros_ptr_->warn(" -- [SUPER] in [ReplanOnce]: Replan overtime, check parameters, replan dt = {}.", replan_dt);
+        if (replan_dt > cfg_.max_replan_time) {
+            ros_ptr_->warn(" -- [SUPER] in [ReplanOnce]: Replan overtime, check parameters, replan dt = {}, max_replan_time = {}.",
+                           replan_dt, cfg_.max_replan_time);
             return FAILED;
         }
 
 
 
         if (back_ret_code == SUCCESS) { //成功 (SUCCESS)：设定 exp_traj_info 和 back_traj_info 作为最终轨迹。
-            cmd_traj_info_.setTrajectory(exp_traj_info, back_traj_info);
+            if (!cmd_traj_info_.setTrajectory(exp_traj_info, back_traj_info)) {
+                ros_ptr_->warn(" -- [SUPER] in [ReplanOnce] reject invalid committed trajectory with backup.");
+                return FAILED;
+            }
             last_exp_traj_info_ = exp_traj_info;
             robot_on_backup_traj_ = false;
             gi_.new_goal = false;
@@ -562,7 +854,10 @@ namespace super_planner {
             return SUCCESS;
         } else if (back_ret_code == FINISH) {
             // Which means the exp traj is all in known free, no need for backup traj
-            cmd_traj_info_.setTrajectory(exp_traj_info);
+            if (!cmd_traj_info_.setTrajectory(exp_traj_info)) {
+                ros_ptr_->warn(" -- [SUPER] in [ReplanOnce] reject invalid committed trajectory without backup.");
+                return FAILED;
+            }
             last_exp_traj_info_ = exp_traj_info;
             robot_on_backup_traj_ = false;
             gi_.new_goal = false;
@@ -588,9 +883,25 @@ namespace super_planner {
     //同时，如果存在备用轨迹并且当前时间已经超过备用轨迹的开始时间，
     //它会设置 robot_on_backup_traj_ 为 true
     void SuperPlanner::getOneHeartbeatTime(double &start_WT_pos, bool &traj_finish) {
+        cmd_traj_info_.lock();
+        if (cmd_traj_info_.empty() || cmd_traj_info_.posTraj().empty()) {
+            start_WT_pos = ros_ptr_->getSimTime();
+            traj_finish = true;
+            robot_on_backup_traj_ = false;
+            cmd_traj_info_.unlock();
+            return;
+        }
+
         double eval_t = (ros_ptr_->getSimTime() - cmd_traj_info_.getStartWallTime());//计算从轨迹开始时间到当前时间的时间差，表示轨迹执行的进度。
         traj_finish = false;
         double total_dur = cmd_traj_info_.getTotalDuration();//获取轨迹的总持续时间。
+        if (total_dur <= 1e-6 || !std::isfinite(total_dur)) {
+            start_WT_pos = cmd_traj_info_.getStartWallTime();
+            traj_finish = true;
+            robot_on_backup_traj_ = false;
+            cmd_traj_info_.unlock();
+            return;
+        }
         if (eval_t > total_dur) {//如果当前时间已经超过轨迹的总时长
             traj_finish = true;
             eval_t = total_dur;
@@ -601,6 +912,7 @@ namespace super_planner {
         } else {
             robot_on_backup_traj_ = false;
         }
+        cmd_traj_info_.unlock();
     }
 
     Trajectory SuperPlanner::getCommittedPositionTrajectory() {
@@ -619,11 +931,34 @@ namespace super_planner {
                                              bool &traj_finish) {
         //从轨迹信息中提取出当前时刻的飞行命令                                        
         cmd_traj_info_.lock();//锁定 
+        if (cmd_traj_info_.empty() || cmd_traj_info_.posTraj().empty()) {
+            pvaj.setZero();
+            pvaj.col(0) = robot_state_.p;
+            yaw = robot_state_.yaw;
+            yaw_dot = 0.0;
+            on_backup_traj = false;
+            traj_finish = true;
+            robot_on_backup_traj_ = false;
+            cmd_traj_info_.unlock();
+            return;
+        }
+
         const double &cur_t = ros_ptr_->getSimTime();//当前时间
         const double &cmd_start_WT = cmd_traj_info_.getStartWallTime();//轨迹的开始时间
 //        const bool &backup_avilibale = cmd_traj_info_.backupTrajAvilibale();
 //        const double &backup_start_TT = cmd_traj_info_.getBackupTrajStartTT();
         const double &total_dur = cmd_traj_info_.getTotalDuration();//轨迹的总持续时间
+        if (total_dur <= 1e-6 || !std::isfinite(total_dur)) {
+            pvaj.setZero();
+            pvaj.col(0) = robot_state_.p;
+            yaw = robot_state_.yaw;
+            yaw_dot = 0.0;
+            on_backup_traj = false;
+            traj_finish = true;
+            robot_on_backup_traj_ = false;
+            cmd_traj_info_.unlock();
+            return;
+        }
 
         traj_finish = (cur_t - cmd_start_WT) > total_dur;// 判断轨迹是否完成
         const double &eval_t = traj_finish ? total_dur : (cur_t - cmd_start_WT);
@@ -632,14 +967,29 @@ namespace super_planner {
         robot_on_backup_traj_ = cmd_traj_info_.isTTOnBackupTraj(eval_t);// 判断是否使用备用轨迹
         on_backup_traj = robot_on_backup_traj_;
 
-        pvaj = cmd_traj_info_.posTraj().getState(eval_t); //获取位置轨迹的状态（位置、速度等
+        if (!cmd_traj_info_.posTraj().getState(eval_t, pvaj)) {
+            pvaj.setZero();
+            pvaj.col(0) = robot_state_.p;
+            yaw = robot_state_.yaw;
+            yaw_dot = 0.0;
+            on_backup_traj = false;
+            traj_finish = true;
+            robot_on_backup_traj_ = false;
+            cmd_traj_info_.unlock();
+            return;
+        }
 
 
         /// Get Yaw planning
         static double last_yaw = robot_state_.yaw;
 
-        yaw = cmd_traj_info_.getYaw((eval_t))[0];//获取航向角（Yaw）和航向角变化率（Yaw dot
-        yaw_dot = cmd_traj_info_.getYawRate((eval_t))[0];
+        if (cmd_traj_info_.yawTraj().empty()) {
+            yaw = last_yaw;
+            yaw_dot = 0.0;
+        } else {
+            yaw = cmd_traj_info_.getYaw((eval_t))[0];//获取航向角（Yaw）和航向角变化率（Yaw dot
+            yaw_dot = cmd_traj_info_.getYawRate((eval_t))[0];
+        }
 
         if (isnan(yaw)) {
             yaw = last_yaw;
@@ -771,6 +1121,7 @@ namespace super_planner {
                         }
                     }
                 }
+
                 if (!gi_.new_goal && last_exp_traj_info.getSFCSize() == 1 && last_exp_traj_info.connectedToGoal()
                     && !has_fresh_dynamic_prediction) {
                     if (cfg_.print_log) {
@@ -787,6 +1138,11 @@ namespace super_planner {
                     } else {
                         return NO_NEED;
                     }
+                }
+                if (!gi_.new_goal && last_exp_traj_info.getSFCSize() == 1 && last_exp_traj_info.connectedToGoal()
+                    && has_fresh_dynamic_prediction && cfg_.print_log) {
+                    ros_ptr_->info(
+                            " -- [SUPER] Replan, last exp is connected to goal, but fresh dynamic predictions exist, continue SFC cutting.");
                 }
 
                 if (!gi_.new_goal &&
@@ -845,18 +1201,6 @@ namespace super_planner {
             }
 
 
-            // * 6) Decide where to split the original exp trajecory and re-plan a new one with an A*,
-            // *    If the whole trajectory if free,  the whole trajectory should be receding and if not, or a new goal
-            // *    is given, we should only receiding a small distance and replan new trajectory ASAP
-            //决定在哪里拆分原来的 exp trajecory，并重新规划一个新的 A*，
-            //如果整个轨迹是自由的，那么整个轨迹应该是后退的，如果不是，或者一个新的目标* 给定，我们应该只接收一小段距离并尽快重新规划新的轨迹
-            //确定轨迹截断点
-            double split_dis = cfg_.receding_dis; //plit_dis 设定为 cfg_.receding_dis（回退距离）。
-            if (last_exp_traj_info.wholeTrajKnownFree() && !gi_.new_goal && cfg_.receding_dis > 0.0) {
-                split_dis = std::numeric_limits<double>::max();//如果整个轨迹都安全(wholeTrajKnownFree() == true) 且没有新的目标(!gi_.new_goal)
-            }
-
-
             // * 7）Begin replan process, first get the replan state from the committed trajectory.
             if (!guide_pos_traj.getState(replan_state_TT, pos_init_state)) {//选择重规划起点
                 ros_ptr_->warn(" -- [SUPER] Invalid traj or eval t");
@@ -868,40 +1212,13 @@ namespace super_planner {
             //生成新的引导路径
             guide_stamp.clear();
             guide_path.clear();
-            if (split_dis <= 0 || last_exp_traj_time_pos.empty()) {//将要到终点了
-                /// No need receding, just path search.//直接将 pos_init_state 作为引导路径的起点
-                guide_path.push_back(pos_init_state.col(0));
-                guide_stamp.push_back(0.0);
-                last_exp_traj_time_pos.clear();
-                last_exp_traj_time_pos.emplace_back(replan_state_TT, pos_init_state.col(0));
-                guide_path_end_vel = robot_state_.v.norm(); //guide_path_end_vel 设为当前速度。
-            } else {
-                temp_pt = last_exp_traj_time_pos.back().second;
-                // * 8) Pop all evaluated pts after the sampled point.
-                //逐步移除所有超出 split_dis 或位于障碍物中的点。
-                while (map_ptr_->isOccupiedInflate(temp_pt) ||
-                       (temp_pt - pos_init_state.col(0)).norm() > split_dis) {
-                    last_exp_traj_time_pos.pop_back();
-                    last_exp_traj_vel.pop_back();
-                    if (last_exp_traj_time_pos.empty()) {
-                        ros_ptr_->warn(" -- [SUPER] WARN, all traj is collide in INF2");
-                        break;
-                    }
-                    temp_pt = last_exp_traj_time_pos.back().second;
-                }
-                if (!last_exp_traj_time_pos.empty()) {
-                    for (long unsigned int i = 0; i < last_exp_traj_time_pos.size(); i++) {
-                        guide_path.push_back(last_exp_traj_time_pos[i].second);
-                        guide_stamp.push_back(last_exp_traj_time_pos[i].first - last_exp_traj_time_pos.front().first);
-                        guide_path_end_vel = last_exp_traj_vel[i];
-                    }
-                } else {
-                    guide_path.push_back(pos_init_state.col(0));//沒有回退轨迹
-                    guide_stamp.push_back(0.0);
-                    last_exp_traj_time_pos.emplace_back(replan_state_TT, pos_init_state.col(0));
-                    guide_path_end_vel = robot_state_.v.norm();
-                }
-            }
+            // Disable old trajectory reuse for frontend guide generation. Each replan starts
+            // from the forward-projected committed state, then searches a fresh D* path.
+            guide_path.push_back(pos_init_state.col(0));
+            guide_stamp.push_back(0.0);
+            last_exp_traj_time_pos.clear();
+            last_exp_traj_time_pos.emplace_back(replan_state_TT, pos_init_state.col(0));
+            guide_path_end_vel = robot_state_.v.norm();
         }
 
         // second, geometry part of the guide path
@@ -964,43 +1281,43 @@ namespace super_planner {
                     ros_ptr_->warn(" -- [SUPER] PathSearch for new path failed");
                     return FAILED;
                 }
+                vec_Vec3f deduped_path;
+                deduped_path.reserve(new_path.size());
+                for (const auto &pt: new_path) {
+                    if (deduped_path.empty() || !samePoint(deduped_path.back(), pt)) {
+                        deduped_path.push_back(pt);
+                    }
+                }
+                new_path.swap(deduped_path);
                 if (new_path.size() < 2) {
                     ros_ptr_->warn(" -- [SUPER] PathSearch for new path failed");
                     return FAILED;
                 }
 
-                // compute total dis
-                // backward compute dis for all points
-                //
-                
-                //计算每个点的路径距离（从后往前）
+                // compute the accumulated path distance from the current guide tail
                 double total_dis{0.0};
-                vector<double> dis(new_path.size());
-                Vec3f last_p = new_path.back();
-                for (int i = new_path.size() - 2; i >= 0; i--) {
-                    auto d = (new_path[i] - last_p).norm();
+                vector<double> dis(new_path.size(), 0.0);
+                Vec3f last_p = guide_path.back();
+                for (size_t i = 0; i < new_path.size(); ++i) {
+                    const auto d = (new_path[i] - last_p).norm();
                     total_dis += d;
-                    dis[i+1] = total_dis;
+                    dis[i] = total_dis;
                     last_p = new_path[i];
                 }
-                total_dis += (new_path.front() - guide_path.back()).norm();
-                dis[0] = total_dis;
 //                for (int i = 0; i < dis.size(); i++) {
 //                    cout << dis[i] << " ";
 //                }
 //                cout << endl;
                 //时间分配
                 vector<double> stamps(new_path.size(), 0);
-                vector<double> dt(new_path.size(), 0);
-                double last_stamp = 0;
-                for (int i = dis.size() - 1; i >= 0; i--) {
+                for (size_t i = 0; i < dis.size(); ++i) {
                     double vel;//距离分布和限制速度/加速度
                     geometry_utils::simplePMTimeAllocator(cfg_.exp_traj_cfg.max_acc, cfg_.exp_traj_cfg.max_vel,
                                                           guide_path_end_vel,
                                                           total_dis,
-                                                          dis[i], stamps[i], vel);
-                    dt[i] = stamps[i] - last_stamp;
-                    last_stamp = stamps[i];
+                                                          dis[i],
+                                                          stamps[i],
+                                                          vel);
                 }
                 double time_stamp = guide_stamp.back();
 
@@ -1015,7 +1332,14 @@ namespace super_planner {
 //                cout << endl;
                 //拼接路径 将 new_path 附加到 guide_path，并记录对应的时间戳
                 for (long unsigned int i = 1; i < new_path.size(); i++) {
-                    double t = dt[i];
+                    if ((new_path[i] - guide_path.back()).norm() < 1.0e-6) {
+                        continue;
+                    }
+                    double t = stamps[i] - stamps[i - 1];
+                    if (!std::isfinite(t) || t <= 0.0) {
+                        t = (new_path[i] - new_path[i - 1]).norm() /
+                            std::max(cfg_.exp_traj_cfg.max_vel, 1.0e-3);
+                    }
                     time_stamp += t;
                     guide_path.emplace_back(new_path[i]);
                     guide_stamp.emplace_back(time_stamp);
@@ -1098,8 +1422,9 @@ namespace super_planner {
         }
         //判断重规划是否超时
         double replan_total_t = (ros_ptr_->getSimTime() - replan_process_start_WT);
-        if (replan_total_t > cfg_.replan_forward_dt) {
-            ros_ptr_->warn(" -- [SUPER] Replan over time({})!!!! Return FAILED", replan_total_t);
+        if (replan_total_t > cfg_.max_replan_time) {
+            ros_ptr_->warn(" -- [SUPER] Replan over time({}) > max_replan_time({})!!!! Return FAILED",
+                           replan_total_t, cfg_.max_replan_time);
             return FAILED;
         }
         //可视化轨迹
@@ -1109,7 +1434,7 @@ namespace super_planner {
             time_consuming_[VISUALIZATION] += t_viz.stop();
         }
 
-        double new_traj_WT = replan_process_start_WT;
+        double new_traj_WT = last_exp_traj_info.empty() ? ros_ptr_->getSimTime() : replan_process_start_WT;
         //对新的轨迹设置时间偏移（世界时间 -> 轨迹时间）
         replan_process_start_TT = replan_process_start_WT - guide_pos_traj.start_WT;
         Trajectory temp_exp_traj;
@@ -1198,17 +1523,50 @@ namespace super_planner {
 
         // 记录当前时刻到最远时刻的所有可视部分
         Vec3f last_pos = ref_exp_traj.getPos(start_t);
+        Vec3f last_eval_pos = last_pos;
+        bool has_last_eval_pos{true};
+        const double risk_gate_end_t =
+                cfg_.backup_traj_risk_gate_en && cfg_.backup_traj_trigger_lookahead_time > 0.0
+                ? std::min(total_dur, start_t + cfg_.backup_traj_trigger_lookahead_time)
+                : total_dur;
         for (out_t = start_t; out_t < total_dur; out_t += cfg_.sample_traj_dt) {
+            if (cfg_.backup_traj_risk_gate_en && out_t > risk_gate_end_t) {
+                break;
+            }
             temp_point = ref_exp_traj.getPos(out_t);
             if ((last_pos - temp_point).norm() < cfg_.resolution * 0.8) {
                 continue;
             }
+            const bool exp_segment_infeasible =
+                    has_last_eval_pos && !map_ptr_->isLineFree(last_eval_pos, temp_point, false, false);
             last_pos = temp_point;
             temp_vel = ref_exp_traj.getVel(out_t);
             // Compute initial
             double v_norm = temp_vel.norm();
             min_stop_dis.push_back(v_norm * v_norm / 2.0 / cfg_.exp_traj_cfg.max_acc);
             eval_ps.push_back(std::pair<double, Vec3f>(out_t, temp_point));
+
+            if (cfg_.backup_traj_risk_gate_en) {
+                Vec3f nearest_occ;
+                const bool exp_point_infeasible = map_ptr_->isOccupied(temp_point);
+                const bool exp_point_near_obstacle =
+                        cfg_.backup_traj_trigger_clearance > 0.0 &&
+                        map_ptr_->getNearestCellIs(GridType::OCCUPIED, temp_point, nearest_occ,
+                                                   cfg_.backup_traj_trigger_clearance);
+
+                if (exp_point_infeasible || exp_segment_infeasible || exp_point_near_obstacle) {
+                    all_traj_visible = false;
+                    if (cfg_.print_log) {
+                        ros_ptr_->info(" -- [SUPER] in [generateBackupTrajectory]: backup risk gate triggered.");
+                    }
+                    break;
+                }
+
+                has_last_eval_pos = true;
+                last_eval_pos = temp_point;
+                continue;
+            }
+
             const double min_dis =
                     cfg_.sensing_horizon > 0 ? std::min(cfg_.sensing_horizon, cfg_.safe_corridor_line_max_length)
                                              : cfg_.safe_corridor_line_max_length;
@@ -1219,6 +1577,8 @@ namespace super_planner {
                 all_traj_visible = false;
                 break;
             }
+            has_last_eval_pos = true;
+            last_eval_pos = temp_point;
         }
 
         if (all_traj_visible) {
@@ -1238,6 +1598,11 @@ namespace super_planner {
                 }
             }
             return FINISH;
+        }
+        if (eval_ps.empty()) {
+            ros_ptr_->warn(" -- [SUPER] in [generateBackupTrajectory]: no sampled backup seed, force return");
+            back_traj_info.setEmpty();
+            return OPT_FAILED;
         }
         Vec3f invisible_p = eval_ps.back().second;
         while (out_t > start_t) {
@@ -1320,14 +1685,24 @@ namespace super_planner {
                 eval_t += cfg_.sample_traj_dt;
                 continue;
             }
-            temp_vel = ref_exp_traj.getVel(out_t);
+            temp_vel = ref_exp_traj.getVel(eval_t);
             double v_norm = temp_vel.norm();
             min_stop_dis.push_back(v_norm * v_norm / 2.0 / cfg_.exp_traj_cfg.max_acc);
             eval_ps.emplace_back(eval_t, cur_pos);
             last_pos = cur_pos;
             eval_t += cfg_.sample_traj_dt;
         }
+        if (eval_ps.size() <= 1) {
+            ros_ptr_->warn(" -- [SUPER] in [generateBackupTrajectory]: backup seed interval is too short, force return");
+            back_traj_info.setEmpty();
+            return OPT_FAILED;
+        }
         eval_ps.pop_back();
+        if (eval_ps.empty()) {
+            ros_ptr_->warn(" -- [SUPER] in [generateBackupTrajectory]: backup seed list is empty, force return");
+            back_traj_info.setEmpty();
+            return OPT_FAILED;
+        }
         seed_point = eval_ps.back().second;
         seed_point_t = eval_ps.back().first;
 
@@ -1336,6 +1711,11 @@ namespace super_planner {
         double t0 = ros_ptr_->getSimTime() -
                     ref_exp_traj.getStartWallTime() + 0.01;
         double te = seed_point_t;
+        if (te <= t0 + 1e-6) {
+            ros_ptr_->warn(" -- [SUPER] in [generateBackupTrajectory]: invalid backup time window, force return");
+            back_traj_info.setEmpty();
+            return OPT_FAILED;
+        }
         //            cout << "t0: " << t0 << endl;
         //            cout << "te: " << te << endl;
         //            cout << "exp_traj_dur: " << ref_exp_traj.optimized_exp_traj.getTotalDuration() << endl;
@@ -1370,19 +1750,6 @@ namespace super_planner {
             latest_replan.setBackupCondition(init_ts, init_times, init_ps,
                                              t0, te,
                                              back_traj_info.getSFC());
-            Trajectory traj;
-            double out_ts;
-            back_traj_opt_->optimize(ref_exp_traj.posTraj(),
-                                     t0,
-                                     te,
-                                     init_ts,
-                                     sfc0,
-                                     init_times,
-                                     init_ps,
-                                     traj,
-                                     out_ts
-            );
-
         }
 
         if (!temp_ret) {
@@ -1504,8 +1871,12 @@ namespace super_planner {
 
         int flag = ON_INF_MAP | (cfg_.frontend_in_known_free ? UNKNOWN_AS_OCCUPIED : UNKNOWN_AS_FREE) | DONT_USE_INF_NEIGHBOR;
 
-        RET_CODE ret_code = astar_ptr_->pointToPointPathSearch(temp_start_point, goal, flag, temp_plannning_horizon,
-                                                               path);
+        bool dstar_path_available = cfg_.use_dstar_lite_frontend;
+        RET_CODE ret_code = cfg_.use_dstar_lite_frontend
+                            ? dstar_lite_ptr_->searchOrRepair(temp_start_point, goal, flag, temp_plannning_horizon,
+                                                              path)
+                            : astar_ptr_->pointToPointPathSearch(temp_start_point, goal, flag,
+                                                                 temp_plannning_horizon, path);
 
         if(ret_code == INIT_ERROR){
             gi_.goal_valid = false;
@@ -1518,14 +1889,32 @@ namespace super_planner {
                    USE_INF_NEIGHBOR;
             fmt::print(fg(fmt::color::indian_red) | fmt::emphasis::bold,
                        " -- [Astar] Path search failed on inf map, try again on prob map.\n");
-            ret_code = astar_ptr_->pointToPointPathSearch(temp_start_point, goal, flag, temp_plannning_horizon,
-                                                          path);
+            ret_code = cfg_.use_dstar_lite_frontend
+                       ? dstar_lite_ptr_->searchOrRepair(temp_start_point, goal, flag, temp_plannning_horizon,
+                                                         path)
+                       : astar_ptr_->pointToPointPathSearch(temp_start_point, goal, flag,
+                                                            temp_plannning_horizon, path);
             if (ret_code == SUCCESS || ret_code == REACH_HORIZON || ret_code == REACH_GOAL) {
                 fmt::print(fg(fmt::color::lime_green) | fmt::emphasis::bold,
                            " -- [Astar] Path search on prob map success.\n");
             } else {
                 fmt::print(fg(fmt::color::indian_red) | fmt::emphasis::bold,
                            " -- [Astar] Path search failed on prob map still failed.\n");
+            }
+        }
+        if (cfg_.use_dstar_lite_frontend && ret_code != REACH_HORIZON && ret_code != REACH_GOAL) {
+            fmt::print(fg(fmt::color::indian_red) | fmt::emphasis::bold,
+                       " -- [D* Lite] Dynamic frontend failed, fallback to A*.\n");
+            dstar_path_available = false;
+            flag = ON_INF_MAP | (cfg_.frontend_in_known_free ? UNKNOWN_AS_OCCUPIED : UNKNOWN_AS_FREE) |
+                   DONT_USE_INF_NEIGHBOR;
+            ret_code = astar_ptr_->pointToPointPathSearch(temp_start_point, goal, flag, temp_plannning_horizon,
+                                                          path);
+            if (ret_code == NO_PATH) {
+                flag = ON_PROB_MAP | (cfg_.frontend_in_known_free ? UNKNOWN_AS_OCCUPIED : UNKNOWN_AS_FREE) |
+                       USE_INF_NEIGHBOR;
+                ret_code = astar_ptr_->pointToPointPathSearch(temp_start_point, goal, flag, temp_plannning_horizon,
+                                                              path);
             }
         }
         if (ret_code != REACH_HORIZON && ret_code != REACH_GOAL) {
@@ -1546,6 +1935,14 @@ namespace super_planner {
         path.insert(path.begin(), start_pt);
         if (ret_code == REACH_GOAL) {
             path.push_back(goal);
+        }
+        const size_t raw_path_size = path.size();
+        shortcutFrontendPath(path, map_ptr_, cfg_.frontend_in_known_free);
+        if (cfg_.print_log && path.size() != raw_path_size) {
+            ros_ptr_->info(std::string(" -- [SUPER] Frontend path smoothing") +
+                           (dstar_path_available ? " (D* Lite): " : " (A*): ") +
+                           std::to_string(raw_path_size) + " -> " +
+                           std::to_string(path.size()) + " points.");
         }
         return true;
     }

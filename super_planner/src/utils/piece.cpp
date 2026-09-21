@@ -23,8 +23,35 @@
 
 #include <data_structure/base/piece.h>
 
+#include <algorithm>
+#include <cfloat>
+#include <cmath>
+#include <limits>
+
 
 using namespace geometry_utils;
+
+namespace {
+    constexpr double kMinPieceDuration = 1e-6;
+    constexpr double kCoeffEps = 1e-12;
+
+    bool isValidPieceData(double duration, int degree, const Eigen::MatrixXd& coeffMat) {
+        return std::isfinite(duration) && duration > kMinPieceDuration &&
+               degree >= 2 && coeffMat.rows() == 3 && coeffMat.cols() == degree + 1 &&
+               coeffMat.allFinite();
+    }
+
+    Eigen::VectorXd trimLeadingZeros(const Eigen::VectorXd& coeffs) {
+        int first = 0;
+        while (first < coeffs.size() && std::fabs(coeffs(first)) < kCoeffEps) {
+            ++first;
+        }
+        if (first >= coeffs.size()) {
+            return Eigen::VectorXd();
+        }
+        return coeffs.tail(coeffs.size() - first).eval();
+    }
+}
 
 // Piece==================================================
 
@@ -156,37 +183,52 @@ Eigen::MatrixXd Piece::normalizeAccCoeffMat() const {
 }
 
 double Piece::getMaxVelRate() const {
+    if (!isValidPieceData(duration, D, coeffMat)) {
+        return std::numeric_limits<double>::infinity();
+    }
     Eigen::MatrixXd nVelCoeffMat = normalizeVelCoeffMat();
+    if (!nVelCoeffMat.allFinite()) {
+        return std::numeric_limits<double>::infinity();
+    }
     Eigen::VectorXd coeff = math_utils::RootFinder::polySqr(nVelCoeffMat.row(0)) +
                             math_utils::RootFinder::polySqr(nVelCoeffMat.row(1)) +
                             math_utils::RootFinder::polySqr(nVelCoeffMat.row(2));
+    if (!coeff.allFinite()) {
+        return std::numeric_limits<double>::infinity();
+    }
     int N = coeff.size();
+    if (N <= 1) {
+        return std::max(getVel(0.0).norm(), getVel(duration).norm());
+    }
     int n = N - 1;
     for (int i = 0; i < N; i++) {
         coeff(i) *= n;
         n--;
     }
 //        print("begin solve poly. {}\n", coeff.head(N - 1).squaredNorm());
-    if (coeff.head(N - 1).squaredNorm() < 1e-6) {
-        return getVel(0.0).norm();
+    Eigen::VectorXd dcoeff = trimLeadingZeros(coeff.head(N - 1));
+    if (dcoeff.size() <= 1 || dcoeff.squaredNorm() < 1e-6) {
+        return std::max(getVel(0.0).norm(), getVel(duration).norm());
     } else {
         double l = -0.0625;
         double r = 1.0625;
         int cnt = 0;
-        while (fabs(math_utils::RootFinder::polyVal(coeff.head(N - 1), l)) < DBL_EPSILON) {
+        while (fabs(math_utils::RootFinder::polyVal(dcoeff, l)) < DBL_EPSILON) {
             l = 0.5 * l;
             if (cnt++ > 100) {
                 std::cout << "math_utils::RootFinder stuck in inf-loop" << std::endl;
+                return std::numeric_limits<double>::infinity();
             }
         }
         cnt = 0;
-        while (fabs(math_utils::RootFinder::polyVal(coeff.head(N - 1), r)) < DBL_EPSILON) {
+        while (fabs(math_utils::RootFinder::polyVal(dcoeff, r)) < DBL_EPSILON) {
             r = 0.5 * (r + 1.0);
             if (cnt++ > 100) {
                 std::cout << "math_utils::RootFinder stuck in inf-loop" << std::endl;
+                return std::numeric_limits<double>::infinity();
             }
         }
-        std::set<double> candidates = math_utils::RootFinder::solvePolynomial(coeff.head(N - 1), l, r,
+        std::set<double> candidates = math_utils::RootFinder::solvePolynomial(dcoeff, l, r,
                                                                               FLT_EPSILON / duration);
         candidates.insert(0.0);
         candidates.insert(1.0);
@@ -197,36 +239,64 @@ double Piece::getMaxVelRate() const {
              it++) {
             if (0.0 <= *it && 1.0 >= *it) {
                 tempNormSqr = getVel((*it) * duration).squaredNorm();
-                maxVelRateSqr = maxVelRateSqr < tempNormSqr ? tempNormSqr : maxVelRateSqr;
+                if (std::isfinite(tempNormSqr)) {
+                    maxVelRateSqr = maxVelRateSqr < tempNormSqr ? tempNormSqr : maxVelRateSqr;
+                }
             }
+        }
+        if (!std::isfinite(maxVelRateSqr) || maxVelRateSqr < 0.0) {
+            return std::numeric_limits<double>::infinity();
         }
         return sqrt(maxVelRateSqr);
     }
 }
 
 double Piece::getMaxAccRate() const {
+    if (!isValidPieceData(duration, D, coeffMat)) {
+        return std::numeric_limits<double>::infinity();
+    }
     Eigen::MatrixXd nAccCoeffMat = normalizeAccCoeffMat();
+    if (!nAccCoeffMat.allFinite()) {
+        return std::numeric_limits<double>::infinity();
+    }
     Eigen::VectorXd coeff = math_utils::RootFinder::polySqr(nAccCoeffMat.row(0)) +
                             math_utils::RootFinder::polySqr(nAccCoeffMat.row(1)) +
                             math_utils::RootFinder::polySqr(nAccCoeffMat.row(2));
+    if (!coeff.allFinite()) {
+        return std::numeric_limits<double>::infinity();
+    }
     int N = coeff.size();
+    if (N <= 1) {
+        return std::max(getAcc(0.0).norm(), getAcc(duration).norm());
+    }
     int n = N - 1;
     for (int i = 0; i < N; i++) {
         coeff(i) *= n;
         n--;
     }
-    if (coeff.head(N - 1).squaredNorm() < DBL_EPSILON) {
-        return getAcc(0.0).norm();
+    Eigen::VectorXd dcoeff = trimLeadingZeros(coeff.head(N - 1));
+    if (dcoeff.size() <= 1 || dcoeff.squaredNorm() < DBL_EPSILON) {
+        return std::max(getAcc(0.0).norm(), getAcc(duration).norm());
     } else {
         double l = -0.0625;
         double r = 1.0625;
-        while (fabs(math_utils::RootFinder::polyVal(coeff.head(N - 1), l)) < DBL_EPSILON) {
+        int cnt = 0;
+        while (fabs(math_utils::RootFinder::polyVal(dcoeff, l)) < DBL_EPSILON) {
             l = 0.5 * l;
+            if (cnt++ > 100) {
+                std::cout << "math_utils::RootFinder stuck in inf-loop" << std::endl;
+                return std::numeric_limits<double>::infinity();
+            }
         }
-        while (fabs(math_utils::RootFinder::polyVal(coeff.head(N - 1), r)) < DBL_EPSILON) {
+        cnt = 0;
+        while (fabs(math_utils::RootFinder::polyVal(dcoeff, r)) < DBL_EPSILON) {
             r = 0.5 * (r + 1.0);
+            if (cnt++ > 100) {
+                std::cout << "math_utils::RootFinder stuck in inf-loop" << std::endl;
+                return std::numeric_limits<double>::infinity();
+            }
         }
-        std::set<double> candidates = math_utils::RootFinder::solvePolynomial(coeff.head(N - 1), l, r,
+        std::set<double> candidates = math_utils::RootFinder::solvePolynomial(dcoeff, l, r,
                                                                               FLT_EPSILON / duration);
         candidates.insert(0.0);
         candidates.insert(1.0);
@@ -237,8 +307,13 @@ double Piece::getMaxAccRate() const {
              it++) {
             if (0.0 <= *it && 1.0 >= *it) {
                 tempNormSqr = getAcc((*it) * duration).squaredNorm();
-                maxAccRateSqr = maxAccRateSqr < tempNormSqr ? tempNormSqr : maxAccRateSqr;
+                if (std::isfinite(tempNormSqr)) {
+                    maxAccRateSqr = maxAccRateSqr < tempNormSqr ? tempNormSqr : maxAccRateSqr;
+                }
             }
+        }
+        if (!std::isfinite(maxAccRateSqr) || maxAccRateSqr < 0.0) {
+            return std::numeric_limits<double>::infinity();
         }
         return sqrt(maxAccRateSqr);
     }
