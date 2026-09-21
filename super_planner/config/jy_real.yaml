@@ -11,7 +11,7 @@ fsm:
   
 
 super_planner:
-  backup_traj_en: true
+  backup_traj_en: false
   backup_traj_risk_gate_en: true
   backup_traj_trigger_clearance: 0.3
   backup_traj_trigger_lookahead_time: 3.0
@@ -21,7 +21,7 @@ super_planner:
   print_log: false  #//打印log
   visual_process: false  #//可视化处理
   frontend_in_known_free: false  #前端在未知边界内？
-  use_dstar_lite_frontend: true
+  use_dstar_lite_frontend: false  # 当前双机局部地图直接使用 A*，避免 D* Lite 修复失败反复回退
   tracking_drift_recovery_en: true
   goal_yaw_en: false
   goal_vel_en: false  #//目标速度开启
@@ -30,12 +30,12 @@ super_planner:
   safe_corridor_line_max_length: 15.0
   iris_iter_num: 2
   obs_skip_num: 2
-  replan_forward_dt: 0.2
+  replan_forward_dt: 0.3
   max_replan_time: 4.0
   planning_horizon: 8.0  #规划界限（改大）
   sensing_horizon: -1  #感知界限
-  receding_dis: 1.0
-  robot_r: 0.18
+  receding_dis: 3.0
+  robot_r: 0.15
   yaw_dot_max: 0.8 #//最大yaw角速度（改大）
   # Yaw mode: 1 heading to velocity, 2 heading to goal
   yaw_mode: 1
@@ -52,7 +52,7 @@ traj_opt:  #轨迹优化参数
 
   boundary:   #///边界参数
     max_vel: 1.0
-    max_acc: 0.8
+    max_acc: 5.8
     max_jerk: 20.0
     max_omg: 1.0
     max_acc_thr: 15.0
@@ -66,7 +66,7 @@ traj_opt:  #轨迹优化参数
     block_energy_cost: false
     opt_accuracy: 1.0e-4
     scale_factor: 1.0
-    integral_reso: 24
+    integral_reso: 15
     smooth_eps: 0.01
     local_density_en: true
     local_density_radius_x: 0.75
@@ -75,7 +75,7 @@ traj_opt:  #轨迹优化参数
     local_density_smooth_eps: 0.08
     local_density_time_inflation: 0.1
     local_density_weight: 1.0e+5
-    penna_t: 1600.0
+    penna_t: 1200.0
     penna_pos: 1.0e+7
     penna_vel: 5.0e+4
     penna_acc: 5.0e+4
@@ -87,10 +87,10 @@ traj_opt:  #轨迹优化参数
     penna_thr: 5.0e+4
 
   backup_traj:
-    pos_constraint_type: 2
+    pos_constraint_type: 1
     piece_num: 2
     energy_cost_type: 4
-    block_energy_cost: false
+    block_energy_cost: true
     opt_accuracy: 1.0e-5
     scale_factor: 1.0
     integral_reso: 12
@@ -106,8 +106,8 @@ traj_opt:  #轨迹优化参数
     trigger_static_clearance: 0.8
     trigger_static_weight: 1.0
     trigger_swarm_weight: 1.0
-    penna_t: 1600.0
-    penna_ts: 1.2e+5
+    penna_t: 1200.0
+    penna_ts: 1.0e+5
     ts_delay_weight: 3.0e+5
     ts_delay_high_order_weight: 1.0e+6
     ts_delay_deadband: 0.05
@@ -135,7 +135,7 @@ traj_opt:  #轨迹优化参数
 
 astar:
   map_voxel_num: [ 120, 120, 50 ]
-  time_out: 1.0
+  time_out: 3.0  # D* Lite 搜索及 A* 回退的单次搜索上限（秒）
   visual_process: false  #可视化
   allow_diag: true  #允许对角线搜索路径
   # 0 DIAG; 1 MANHATTAN; 2 EUCLIDEAN
