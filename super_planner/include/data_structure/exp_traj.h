@@ -58,6 +58,12 @@ namespace super_planner {
             flag_empty_ = true;
         }
 
+        void resetStartWallTime(const double start_wt) {
+            start_WT_ = start_wt;
+            pos_traj_.start_WT = start_wt;
+            yaw_traj_.start_WT = start_wt;
+        }
+
         bool empty() const {
             return flag_empty_;
         }

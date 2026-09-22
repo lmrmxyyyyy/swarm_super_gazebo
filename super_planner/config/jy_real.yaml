@@ -52,7 +52,7 @@ traj_opt:  #轨迹优化参数
 
   boundary:   #///边界参数
     max_vel: 1.0
-    max_acc: 5.8
+    max_acc: 3.0
     max_jerk: 20.0
     max_omg: 1.0
     max_acc_thr: 15.0
@@ -155,11 +155,11 @@ rog_map:
   frontier_extraction_en: false  ##//边界提取
 
   # Virtual ceil and ground
-  virtual_ceil_height: 2.5  #虚拟天花板
-  # ROG-Map adds 0.15 m here for 0.1 m resolution/inflation_step=1.
-  # Swarm-LIO starts near local z=0, so -0.3 keeps initialization and
-  # takeoff point-cloud updates inside the valid map volume.
-  virtual_ground_height: -0.3 #虚拟地面
+  virtual_ceil_height: 2.0  #虚拟天花板
+  # ROG-Map raises the configured ground by inflation_step * resolution,
+  # then the corridor shrinks the map bound by robot_r. Leave enough room
+  # for a Swarm-LIO takeoff seed near local z=0.
+  virtual_ground_height: -0.5 #虚拟地面
 
   load_pcd_en: false #加载点云
 

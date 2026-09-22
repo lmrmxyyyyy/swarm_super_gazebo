@@ -28,6 +28,7 @@ find_package(catkin REQUIRED COMPONENTS
         pcl_ros
         geometry_msgs
         nav_msgs
+        mavros_msgs
         message_generation
         quadrotor_msgs
         visualization_msgs
@@ -46,7 +47,7 @@ find_package(PCL REQUIRED)
 catkin_package(
         INCLUDE_DIRS
         LIBRARIES super_planner
-        CATKIN_DEPENDS roscpp rospy std_msgs
+        CATKIN_DEPENDS roscpp rospy std_msgs mavros_msgs
         #  DEPENDS system_lib
 )
 

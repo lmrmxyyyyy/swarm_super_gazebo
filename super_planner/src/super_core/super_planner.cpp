@@ -923,6 +923,20 @@ namespace super_planner {
         return cmd_traj_info_.yawTraj();
     }
 
+    bool SuperPlanner::startPrestreamedTrajectory() {
+        std::lock_guard<std::mutex> guard(replan_lock_);
+        if (last_exp_traj_info_.empty()) {
+            return false;
+        }
+        const double start_wt = ros_ptr_->getSimTime();
+        if (!cmd_traj_info_.resetStartWallTime(start_wt)) {
+            return false;
+        }
+        last_exp_traj_info_.resetStartWallTime(start_wt);
+        consecutive_exp_replan_fail_count_ = 0;
+        return true;
+    }
+
 
     void SuperPlanner::getOneCommandFromTraj(StatePVAJ &pvaj,
                                              double &yaw,

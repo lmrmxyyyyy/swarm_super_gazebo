@@ -35,10 +35,13 @@
 #include "nav_msgs/Odometry.h"
 #include "quadrotor_msgs/PositionCommand.h"
 #include "quadrotor_msgs/PolynomialTrajectory.h"
+#include "mavros_msgs/State.h"
 #include <ius_msgs/Trajectory.h>
 #include "std_msgs/Int8.h"
 #include <std_msgs/Float64.h>
 #include <std_msgs/Bool.h> 
+#include <atomic>
+#include <stdexcept>
 // #include <utils/header/type_utils.hpp>
 
 // #include <super_core/super_planner.h>
@@ -47,7 +50,7 @@
 namespace fsm {//定义了fsm 命名空间
     class FsmRos1 : public Fsm {//FsmRos1 继承了 Fsm 类，意味着它是一个特化的有限状态机
         ros::NodeHandle nh_;//ros::NodeHandle 对象
-        ros::Subscriber goal_sub_,state_sub;//目标ROS 订阅器
+        ros::Subscriber goal_sub_,state_sub, mavros_state_sub_;//目标ROS 订阅器
         ros::Publisher cmd_pub, mpc_cmd_pub_, path_pub_;//发布器，用于发布命令消息
         ros::Timer execution_timer_, replan_timer_, cmd_timer_;//执行定时器//重新规划定时器//命令定时器
         quadrotor_msgs::PositionCommand pid_cmd_;
@@ -60,9 +63,12 @@ namespace fsm {//定义了fsm 命名空间
         // ros::Subscriber yaw1_sub,yaw2_sub;
         // double fractory1_yaw,fractory2_yaw;
         double init_exp_traj_cfg_max_acc,init_exp_traj_cfg_max_vel,init_receding_dis;
-        Eigen::Vector3d last_tarj_start_p;
-        ros::Time last_tarj_start_t;
-        bool last_tarj_start_valid_{false};
+        bool sync_takeoff_to_arming_{false};
+        std::string uav_name_;
+        std::atomic<bool> px4_armed_{false};
+        std::atomic<bool> px4_offboard_{false};
+        // 0: waiting for arming, 1: rebasing, 2: trajectory running.
+        std::atomic<int> takeoff_phase_{0};
         bool publish_mpc_pred_traj_{true};
         double mpc_pred_traj_horizon_{4.0};
         Eigen::Vector3d inertial_origin_{Eigen::Vector3d::Zero()};
@@ -100,6 +106,17 @@ namespace fsm {//定义了fsm 命名空间
 
             ius_msgs::Trajectory robomaster_traj_msg_;
             if (getCommittedTrajectory_to_rm(robomaster_traj_msg_)) {
+                if (sync_takeoff_to_arming_ && takeoff_phase_.load() == 0) {
+                    // Keep the controller streaming a stationary reference for
+                    // PX4's OFFBOARD prestream. The takeoff clock starts only
+                    // after PX4 confirms both OFFBOARD and arming.
+                    const geometry_msgs::Point hold_pos = robomaster_traj_msg_.pos.front();
+                    const double hold_yaw = robomaster_traj_msg_.yaw.front();
+                    robomaster_traj_msg_.pos.assign(2, hold_pos);
+                    robomaster_traj_msg_.yaw.assign(2, hold_yaw);
+                    robomaster_traj_msg_.time = {0.0, 1.0};
+                    robomaster_traj_msg_.header.stamp = ros::Time::now();
+                }
                 visualizePath_rm(robomaster_traj_msg_);
                 rm_traj_pub.publish(robomaster_traj_msg_);
             }
@@ -202,14 +219,9 @@ namespace fsm {//定义了fsm 命名空间
             }
             double eval_t = 0.0001; // 初始时间
             Eigen::Vector3d last_pos = pos_traj.getPos(0); // 轨迹起点
-            if (last_tarj_start_valid_ && (last_pos - last_tarj_start_p).norm() < 1e-6) {
-                robomaster_traj_msg_.header.stamp = last_tarj_start_t;
-            } else {
-                robomaster_traj_msg_.header.stamp = ros::Time::now(); // 时间戳
-                last_tarj_start_t = robomaster_traj_msg_.header.stamp;
-                last_tarj_start_p = last_pos;
-                last_tarj_start_valid_ = true;
-            }
+            // The controller samples relative to this timestamp. Use the
+            // committed trajectory's own clock, including after takeoff rebasing.
+            robomaster_traj_msg_.header.stamp.fromSec(pos_traj.start_WT);
 
             // 清空旧轨迹数据
             robomaster_traj_msg_.pos.clear();
@@ -467,6 +479,11 @@ namespace fsm {//定义了fsm 命名空间
             // }
 
         }
+
+        void mavrosStateCallback(const mavros_msgs::State::ConstPtr& msg) {
+            px4_armed_.store(msg->armed);
+            px4_offboard_.store(msg->mode == "OFFBOARD");
+        }
             // czc
         void stop_superCallback(const std_msgs::Bool::ConstPtr& msg)
         {
@@ -501,6 +518,11 @@ namespace fsm {//定义了fsm 命名空间
             ros::NodeHandle pnh("~");
             pnh.param("publish_mpc_pred_traj", publish_mpc_pred_traj_, true);
             pnh.param("mpc_pred_traj_horizon", mpc_pred_traj_horizon_, 4.0);
+            pnh.param("sync_takeoff_to_arming", sync_takeoff_to_arming_, false);
+            pnh.param<std::string>("uav_name", uav_name_, std::string());
+            if (sync_takeoff_to_arming_ && uav_name_.empty()) {
+                throw std::runtime_error("sync_takeoff_to_arming requires uav_name");
+            }
             pnh.param("inertial_origin_x", inertial_origin_.x(), 0.0);
             pnh.param("inertial_origin_y", inertial_origin_.y(), 0.0);
             pnh.param("inertial_origin_z", inertial_origin_.z(), 0.0);
@@ -532,6 +554,11 @@ namespace fsm {//定义了fsm 命名空间
             }
             rm_path_pub = nh_.advertise<nav_msgs::Path>("/rm_mpc_trajectory_vis_path", 1);
             target_in_obs_pub= nh_.advertise<std_msgs::Int8>("/target_in_obs", 1);
+            if (sync_takeoff_to_arming_) {
+                mavros_state_sub_ = nh_.subscribe<mavros_msgs::State>(
+                    "/" + uav_name_ + "/mavros/state", 1,
+                    &FsmRos1::mavrosStateCallback, this);
+            }
             
             //初始化目标订阅器
             int cmd_cnt = 0;
@@ -581,6 +608,11 @@ namespace fsm {//定义了fsm 命名空间
         }
 
         void pubCmdTimerCallback(const ros::TimerEvent &event) {
+            // The MPC controller keeps sending the pre-streamed trajectory to
+            // PX4, while this planner clock stays parked until arming.
+            if (sync_takeoff_to_arming_ && takeoff_phase_.load() != 2) {
+                return;
+            }
             if (stop) {  // 不发command
                 return;
             }
@@ -606,11 +638,31 @@ namespace fsm {//定义了fsm 命名空间
         }
 
         void replanTimerCallback(const ros::TimerEvent &event) {
+            if (sync_takeoff_to_arming_ && takeoff_phase_.load() != 2) {
+                return;
+            }
             callReplanOnce();
         }
 
         void mainFsmTimerCallback(const ros::TimerEvent &event) {
             callMainFsmOnce();
+            if (!sync_takeoff_to_arming_ || takeoff_phase_.load() != 0 ||
+                machine_state_ != FOLLOW_TRAJ || !px4_armed_.load() ||
+                !px4_offboard_.load()) {
+                return;
+            }
+            int waiting = 0;
+            if (!takeoff_phase_.compare_exchange_strong(waiting, 1)) {
+                return;
+            }
+            if (!planner_ptr_->startPrestreamedTrajectory()) {
+                takeoff_phase_.store(0);
+                ROS_WARN_THROTTLE(1.0, "Takeoff trajectory is not ready for clock synchronization");
+                return;
+            }
+            publishPolyTraj();
+            takeoff_phase_.store(2);
+            ROS_INFO("Takeoff trajectory clock started on PX4 OFFBOARD and armed confirmation");
         }
 
     };

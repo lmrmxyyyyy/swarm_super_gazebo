@@ -164,6 +164,9 @@ namespace super_planner {
 
         Trajectory getCommittedYawTrajectory();
 
+        // Start a pre-streamed takeoff trajectory when PX4 actually arms.
+        bool startPrestreamedTrajectory();
+
         void getOneCommandFromTraj(StatePVAJ &pvaj,
                                    double &yaw,
                                    double &yaw_dot,

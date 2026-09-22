@@ -20,6 +20,7 @@
 <!--     2. use file name in super_planner/config/... -->
         <param name="config_name" value="jy_real.yaml" type="string"></param>
         <param name="uav_name" value="uav1" type="string"></param>
+        <param name="sync_takeoff_to_arming" value="true" type="bool"></param>
         <param name="start_x" value="$(arg start_x)" type="double"></param>
         <param name="start_y" value="$(arg start_y)" type="double"></param>
         <param name="start_z" value="$(arg start_z)" type="double"></param>
@@ -53,6 +54,7 @@
     <node pkg="super_planner" name="fsm_node_uav2" type="fsm_node" output="screen" ns="uav2">
         <param name="config_name" value="jy_real.yaml" type="string"></param>
         <param name="uav_name" value="uav2" type="string"></param>
+        <param name="sync_takeoff_to_arming" value="true" type="bool"></param>
         <param name="start_x" value="$(arg start_x)" type="double"></param>
         <param name="start_y" value="$(arg start_y)" type="double"></param>
         <param name="start_z" value="$(arg start_z)" type="double"></param>

@@ -96,6 +96,17 @@ namespace super_planner {
             mtx_.unlock();
         }
 
+        bool resetStartWallTime(const double start_wt) {
+            LOCK_G
+            if (flag_empty_ || pos_traj_.empty() || yaw_traj_.empty()) {
+                return false;
+            }
+            start_WT_ = start_wt;
+            pos_traj_.start_WT = start_wt;
+            yaw_traj_.start_WT = start_wt;
+            return true;
+        }
+
 
         bool setTrajectory(const ExpTraj&exp_traj,
             const BackupTraj & backup_traj) {
