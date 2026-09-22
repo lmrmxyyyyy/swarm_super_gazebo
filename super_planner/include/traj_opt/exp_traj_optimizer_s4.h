@@ -82,6 +82,7 @@ namespace traj_opt {
             int piece_num;
             Mat3Df points;
             VecDf times;
+            VecDf min_piece_times;
             VecDf magnitudeBounds, penaltyWeights;
 
             PolyhedraV vPolytopes; // the original sfc and intersecting sfc

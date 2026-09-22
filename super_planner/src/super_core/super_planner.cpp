@@ -610,6 +610,8 @@ namespace super_planner {
                 return FAILED;
             }
             last_exp_traj_info_ = exp_traj_info; // 更新最后的扩展轨迹信息
+            safe_stop_start_wt_ = -1.0;
+            next_failed_replan_wt_ = 0.0;
             robot_on_backup_traj_ = false;  /// 标记机器人不在备用轨迹上
             gi_.new_goal = false;  //// 标记目标已处理
 
@@ -633,6 +635,8 @@ namespace super_planner {
                 return FAILED;
             }
             last_exp_traj_info_ = exp_traj_info;
+            safe_stop_start_wt_ = -1.0;
+            next_failed_replan_wt_ = 0.0;
             gi_.new_goal = false;
 
             // For visualization
@@ -651,6 +655,126 @@ namespace super_planner {
     }
 
 
+    bool SuperPlanner::trajectorySegmentSafe(const Trajectory &traj, double from_t, double to_t) {
+        if (traj.empty() || !std::isfinite(from_t) || !std::isfinite(to_t) ||
+            from_t < 0.0 || to_t < from_t || to_t > traj.getTotalDuration() + 1e-6) {
+            return false;
+        }
+        std::vector<traj_opt::SwarmPrediction> predictions;
+        buildSwarmPredictions(predictions);
+        Vec3f previous = traj.getPos(from_t);
+        if (!previous.allFinite() || map_ptr_->isOccupied(previous)) {
+            return false;
+        }
+        const double separation = 2.0 * cfg_.robot_r + dynamic_collision_clearance_;
+        const int sample_count = std::max(1, static_cast<int>(std::ceil((to_t - from_t) / 0.05)));
+        for (int i = 0; i <= sample_count; ++i) {
+            const double eval_t = from_t + (to_t - from_t) * i / sample_count;
+            const Vec3f position = traj.getPos(eval_t);
+            if (!position.allFinite() || map_ptr_->isOccupied(position) ||
+                ((position - previous).norm() > 1e-6 &&
+                 !map_ptr_->isLineFree(previous, position, true, false))) {
+                return false;
+            }
+            for (const auto &prediction: predictions) {
+                Vec3f other_pos, other_vel;
+                if (prediction.sample(traj.start_WT + eval_t, other_pos, other_vel) &&
+                    (position - other_pos).norm() < separation) {
+                    return false;
+                }
+            }
+            previous = position;
+        }
+        return true;
+    }
+
+    bool SuperPlanner::committedTrajectorySafeFor(const double horizon) {
+        Trajectory committed;
+        cmd_traj_info_.lock();
+        if (cmd_traj_info_.empty()) {
+            cmd_traj_info_.unlock();
+            return false;
+        }
+        committed = cmd_traj_info_.posTraj();
+        cmd_traj_info_.unlock();
+        const double from_t = ros_ptr_->getSimTime() - committed.start_WT;
+        if (from_t < 0.0 || from_t + horizon > committed.getTotalDuration()) {
+            return false;
+        }
+        if (!robot_state_.rcv ||
+            (robot_state_.p - committed.getPos(from_t)).norm() > 0.5) {
+            return false;
+        }
+        return trajectorySegmentSafe(committed, from_t, from_t + horizon);
+    }
+
+    bool SuperPlanner::commitSafeStopTrajectory() {
+        const double now = ros_ptr_->getSimTime();
+        if (!robot_state_.rcv || now - robot_state_.rcv_time > 0.2 ||
+            !robot_state_.p.allFinite() || !robot_state_.v.allFinite() ||
+            !robot_state_.a.allFinite() || !std::isfinite(robot_state_.yaw) ||
+            map_ptr_->isOccupied(robot_state_.p)) {
+            return false;
+        }
+        const double allowed_velocity = std::max(cfg_.exp_traj_cfg.max_vel * 1.05,
+                                                  robot_state_.v.norm() * 1.05);
+        const double allowed_acceleration = std::max(cfg_.exp_traj_cfg.max_acc * 1.05,
+                                                      robot_state_.a.norm() * 1.05);
+
+        for (const double duration: {1.5, 2.0, 2.5, 3.0, 4.0}) {
+            StatePVAJ head = StatePVAJ::Zero(), tail = StatePVAJ::Zero();
+            head.col(0) = robot_state_.p;
+            head.col(1) = robot_state_.v;
+            head.col(2) = robot_state_.a;
+            tail.col(0) = robot_state_.p + 0.5 * duration * robot_state_.v;
+
+            traj_opt::MINCO_S4NU minco;
+            minco.setConditions(head, tail, 1);
+            Eigen::MatrixXd no_waypoints(3, 0);
+            Eigen::VectorXd times(1);
+            times[0] = duration;
+            minco.setParameters(no_waypoints, times);
+            Trajectory stop_pos;
+            minco.getTrajectory(stop_pos);
+            stop_pos.start_WT = now;
+
+            bool dynamics_safe = !stop_pos.empty();
+            for (double t = 0.0; dynamics_safe && t <= duration + 1e-6; t += 0.02) {
+                const double eval_t = std::min(t, duration);
+                const Vec3f vel = stop_pos.getVel(eval_t);
+                const Vec3f acc = stop_pos.getAcc(eval_t);
+                const Vec3f jerk = stop_pos.getJer(eval_t);
+                dynamics_safe = vel.allFinite() && acc.allFinite() && jerk.allFinite() &&
+                        vel.norm() <= allowed_velocity &&
+                        acc.norm() <= allowed_acceleration &&
+                        jerk.norm() <= cfg_.exp_traj_cfg.max_jerk * 1.05;
+            }
+            if (!dynamics_safe || !trajectorySegmentSafe(stop_pos, 0.0, duration)) {
+                continue;
+            }
+
+            Eigen::Matrix<double, 3, 8> yaw_coeff = Eigen::Matrix<double, 3, 8>::Zero();
+            yaw_coeff(0, 7) = robot_state_.yaw;
+            Trajectory stop_yaw;
+            stop_yaw.emplace_back(duration, yaw_coeff);
+            stop_yaw.start_WT = now;
+            ExpTraj stop_exp;
+            stop_exp.setTrajectory(now, stop_pos, stop_yaw);
+            if (!cmd_traj_info_.setTrajectory(stop_exp)) {
+                return false;
+            }
+            last_exp_traj_info_ = stop_exp;
+            safe_stop_start_wt_ = now;
+            consecutive_exp_replan_fail_count_ = 0;
+            next_failed_replan_wt_ = now + 0.5;
+            latest_replan.setRetCode(SUPER_SUCCESS_NO_BACKUP);
+            ros_ptr_->warn(" -- [SUPER] Replan failed near trajectory end; committed a checked {:.1f}s braking trajectory.",
+                           duration);
+            return true;
+        }
+        return false;
+    }
+
     RET_CODE
     SuperPlanner::ReplanOnce(const Vec3f &goal_p,
                              const double &goal_yaw,
@@ -658,12 +782,18 @@ namespace super_planner {
         TimeConsuming replan_total_t("ReplanOnce", false);//记录重规划总时间
         std::lock_guard<std::mutex> guard(replan_lock_); //线程锁
 
+        const bool goal_changed = (goal_p - gi_.goal_p).norm() > 1e-3;
         gi_.goal_p = goal_p;// 设置目标位置、目标航向以及是否为新目标
         gi_.goal_yaw = goal_yaw;
         gi_.new_goal = new_goal;
         gi_.goal_valid = true;
         latest_replan.reset();
         latest_replan.setGoal(goal_p, goal_yaw, robot_state_);
+
+        const double replan_now = ros_ptr_->getSimTime();
+        if (!goal_changed && replan_now < next_failed_replan_wt_) {
+            return FAILED;
+        }
 
         // 可视化目标点和当前机器人位置
         vec_Vec3f viz_pts{goal_p, robot_state_.p};
@@ -691,6 +821,8 @@ namespace super_planner {
             cmd_traj_info_.unlock();
         }
 
+        ExpTraj planning_reference = last_exp_traj_info_;
+        const Vec3f previous_local_start_p = local_start_p_;
         if (force_plan_from_actual) {
             Vec3f local_start_pt;
             if (!map_ptr_->getNearestCellNot(GridType::OCCUPIED, robot_state_.p, local_start_pt, 3.0)) {
@@ -700,7 +832,7 @@ namespace super_planner {
             }
             ros_ptr_->warn(" -- [SUPER] in [ReplanOnce]: tracking drift {} m, restart planning from actual state.",
                            tracking_error);
-            last_exp_traj_info_.setEmpty();
+            planning_reference.setEmpty();
             local_start_p_ = local_start_pt;
         }
 
@@ -709,17 +841,40 @@ namespace super_planner {
         //生成期望轨迹
         ExpTraj exp_traj_info;
         TimeConsuming t_exp("t_exp", false);
-        RET_CODE exp_ret_code = generateExpTraj(last_exp_traj_info_, exp_traj_info);
+        RET_CODE exp_ret_code = generateExpTraj(planning_reference, exp_traj_info);
         time_consuming_[GENERATE_EXP_TRAJ] = t_exp.stop();
 
         if (exp_ret_code == FAILED) {
+            local_start_p_ = previous_local_start_p;
             ++consecutive_exp_replan_fail_count_;
             ros_ptr_->warn(" -- [SUPER] in [ReplanOnce]: GenerateExpTrajectory failed {}/{}.",
                            consecutive_exp_replan_fail_count_,
                            max_consecutive_exp_replan_failures_);
 
+            // Keep the previous checked path while it has a safe horizon.
+            // Repeatedly discarding it creates a new start state every few
+            // timer ticks and can make the vehicle reverse direction.
+            if (committedTrajectorySafeFor(1.0)) {
+                next_failed_replan_wt_ = replan_now + 0.3;
+                return FAILED;
+            }
+
+            cmd_traj_info_.lock();
+            const bool already_braking = !cmd_traj_info_.empty() &&
+                    std::abs(cmd_traj_info_.getStartWallTime() - safe_stop_start_wt_) < 1e-4;
+            cmd_traj_info_.unlock();
+            if (already_braking) {
+                next_failed_replan_wt_ = replan_now + 0.3;
+                return FAILED;
+            }
+            if (commitSafeStopTrajectory()) {
+                return SUCCESS;
+            }
+
             if (cfg_.tracking_drift_recovery_en &&
-                consecutive_exp_replan_fail_count_ > max_consecutive_exp_replan_failures_) {
+                consecutive_exp_replan_fail_count_ > max_consecutive_exp_replan_failures_ &&
+                (last_recovery_wt_ < 0.0 || replan_now - last_recovery_wt_ >= 1.0)) {
+                last_recovery_wt_ = replan_now;
                 Vec3f local_start_pt;
                 if (!robot_state_.rcv ||
                     !map_ptr_->getNearestCellNot(GridType::OCCUPIED, robot_state_.p, local_start_pt, 3.0)) {
@@ -730,6 +885,8 @@ namespace super_planner {
 
                 ros_ptr_->warn(
                         " -- [SUPER] in [ReplanOnce]: repeated exp failures, restart planning from actual state.");
+                const ExpTraj previous_exp_traj = last_exp_traj_info_;
+                const Vec3f previous_start_p = local_start_p_;
                 last_exp_traj_info_.setEmpty();
                 local_start_p_ = local_start_pt;
 
@@ -738,8 +895,11 @@ namespace super_planner {
                 exp_ret_code = generateExpTraj(last_exp_traj_info_, recovery_exp_traj_info);
                 time_consuming_[GENERATE_EXP_TRAJ] += t_recovery_exp.stop();
                 if (exp_ret_code == FAILED) {
+                    last_exp_traj_info_ = previous_exp_traj;
+                    local_start_p_ = previous_start_p;
                     ros_ptr_->warn(" -- [SUPER] in [ReplanOnce]: recovery GenerateExpTrajectory failed, force return");
                     consecutive_exp_replan_fail_count_ = 0;
+                    next_failed_replan_wt_ = replan_now + 0.5;
                     return FAILED;
                 } else if (exp_ret_code == NEW_TRAJ) {
                     consecutive_exp_replan_fail_count_ = 0;
@@ -752,6 +912,7 @@ namespace super_planner {
                 exp_traj_info = recovery_exp_traj_info;
                 consecutive_exp_replan_fail_count_ = 0;
             } else {
+                next_failed_replan_wt_ = replan_now + 0.3;
                 return FAILED;
             }
         } else if (exp_ret_code == NEW_TRAJ) {
@@ -765,6 +926,7 @@ namespace super_planner {
             return EMER;
         } else if (exp_ret_code == SUCCESS) {
             consecutive_exp_replan_fail_count_ = 0;
+            next_failed_replan_wt_ = 0.0;
             if (cfg_.print_log) {
                 ros_ptr_->info(" -- [SUPER] in [ReplanOnce]: Replan a new exp traj success.");
             }
@@ -820,6 +982,8 @@ namespace super_planner {
                 return FAILED;
             }
             last_exp_traj_info_ = exp_traj_info;
+            safe_stop_start_wt_ = -1.0;
+            next_failed_replan_wt_ = 0.0;
             robot_on_backup_traj_ = false;
             gi_.new_goal = false;
 
@@ -838,6 +1002,8 @@ namespace super_planner {
             // 这次生成backup轨迹的点没有意义,
             robot_on_backup_traj_ = false;
             last_exp_traj_info_ = exp_traj_info;
+            safe_stop_start_wt_ = -1.0;
+            next_failed_replan_wt_ = 0.0;
             gi_.new_goal = false;
 
 
@@ -859,6 +1025,8 @@ namespace super_planner {
                 return FAILED;
             }
             last_exp_traj_info_ = exp_traj_info;
+            safe_stop_start_wt_ = -1.0;
+            next_failed_replan_wt_ = 0.0;
             robot_on_backup_traj_ = false;
             gi_.new_goal = false;
 

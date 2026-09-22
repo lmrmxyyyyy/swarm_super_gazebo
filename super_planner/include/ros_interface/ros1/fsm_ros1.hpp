@@ -264,7 +264,24 @@ namespace fsm {//定义了fsm 命名空间
                 last_pos = cur_pos; // 更新上一个点的位置
                 eval_t += dt; // 更新采样时间
             }
-            if (robomaster_traj_msg_.pos.empty()) return false;
+            if (robomaster_traj_msg_.pos.size() < 2) {
+                // A short braking or hover trajectory can move less than the
+                // 5 cm sampling threshold; the MPC still needs two samples.
+                robomaster_traj_msg_.pos.clear();
+                robomaster_traj_msg_.yaw.clear();
+                robomaster_traj_msg_.time.clear();
+                for (const double t: {0.0, total_duration}) {
+                    const Eigen::Vector3d p = pos_traj.getPos(t);
+                    geometry_msgs::Point point;
+                    point.x = p.x();
+                    point.y = p.y();
+                    point.z = p.z();
+                    robomaster_traj_msg_.pos.push_back(point);
+                    robomaster_traj_msg_.yaw.push_back(
+                            yaw_traj.empty() ? 0.0 : yaw_traj.getPos(t)[0]);
+                    robomaster_traj_msg_.time.push_back(t);
+                }
+            }
             return true;
         }
         void visualizePath_rm(const ius_msgs::Trajectory &traj_msg) {

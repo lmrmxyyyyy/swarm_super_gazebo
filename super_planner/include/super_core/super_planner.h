@@ -106,6 +106,13 @@ namespace super_planner {
 
         int consecutive_exp_replan_fail_count_{0};
         int max_consecutive_exp_replan_failures_{5};
+        double next_failed_replan_wt_{0.0};
+        double last_recovery_wt_{-1.0};
+        double safe_stop_start_wt_{-1.0};
+
+        bool committedTrajectorySafeFor(double horizon);
+        bool trajectorySegmentSafe(const Trajectory &traj, double from_t, double to_t);
+        bool commitSafeStopTrajectory();
 
         vector<double> time_consuming_;
 

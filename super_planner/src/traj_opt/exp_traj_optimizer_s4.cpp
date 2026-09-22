@@ -105,15 +105,20 @@ namespace {
         return true;
     }
 
-    void forwardMapTauToBoundedT(const VecDf &tau, VecDf &times) {
+    void forwardMapTauToBoundedT(const VecDf &tau, const VecDf &min_piece_times, VecDf &times) {
         gcopter::forwardMapTauToT(tau, times);
-        times.array() += kMinStablePieceTime;
+        if (min_piece_times.size() == tau.size()) {
+            times += min_piece_times;
+        } else {
+            times.array() += kMinStablePieceTime;
+        }
     }
 
     template<typename EIGENVEC>
-    void backwardMapBoundedTToTau(const VecDf &times, EIGENVEC &tau) {
-        const VecDf positive_times =
-                (times.array() - kMinStablePieceTime).max(kMinMappedPieceTime).matrix();
+    void backwardMapBoundedTToTau(const VecDf &times, const VecDf &min_piece_times, EIGENVEC &tau) {
+        const VecDf positive_times = min_piece_times.size() == times.size()
+                ? (times - min_piece_times).array().max(kMinMappedPieceTime).matrix().eval()
+                : (times.array() - kMinStablePieceTime).max(kMinMappedPieceTime).matrix().eval();
         gcopter::backwardMapTToTau(positive_times, tau);
     }
 
@@ -505,7 +510,7 @@ double ExpTrajOpt::costFunctional(void *ptr,
 
     Mat3Df points;
     VecDf times;
-    forwardMapTauToBoundedT(tau, times);
+    forwardMapTauToBoundedT(tau, obj.min_piece_times, times);
     if (!times.allFinite()) {
         g.setZero();
         obj.penalty_log.setZero();
@@ -937,7 +942,7 @@ double ExpTrajOpt::optimize(Trajectory &traj, const double &relCostTol) {
 
     /* 3)  construct the initial guess of the optimization varibles*/
     //③ 初始化优化变量（初值）
-    backwardMapBoundedTToTau(opt_vars.times, tau);
+    backwardMapBoundedTToTau(opt_vars.times, opt_vars.min_piece_times, tau);
     switch (opt_vars.pos_constraint_type) {
         case 1: {
             MatDf p_e = opt_vars.points;
@@ -998,7 +1003,7 @@ double ExpTrajOpt::optimize(Trajectory &traj, const double &relCostTol) {
                                     lbfgs_params);
     // double dt = ttt.stop();
     //⑦ 解包优化结果
-    forwardMapTauToBoundedT(tau, opt_vars.times);
+    forwardMapTauToBoundedT(tau, opt_vars.min_piece_times, opt_vars.times);
     if (cfg_.print_optimizer_log) {
         cout << " -- [ExpOpt] Opt finish, with iter num: " << opt_vars.iter_num << "\n";
         cout << "\tEnergy: " << opt_vars.penalty_log(0) << endl;
@@ -1045,7 +1050,7 @@ double ExpTrajOpt::optimize(Trajectory &traj, const double &relCostTol) {
     }
 
     if (ret >= 0) {
-        forwardMapTauToBoundedT(tau, opt_vars.times);
+        forwardMapTauToBoundedT(tau, opt_vars.min_piece_times, opt_vars.times);
         switch (opt_vars.pos_constraint_type) {
             case 1: {
                 VecDf xi_e = xi;
@@ -1249,6 +1254,7 @@ bool ExpTrajOpt::optimize(const StatePVAJ &headPVAJ, const StatePVAJ &tailPVAJ,
     //设置优化变量
     opt_vars.default_init = false;
     opt_vars.given_init_ts_and_ps = false;
+    opt_vars.min_piece_times.resize(0);
     opt_vars.headPVAJ = headPVAJ;
     opt_vars.tailPVAJ = tailPVAJ;
     opt_vars.guide_path = guide_path;
@@ -1299,7 +1305,9 @@ bool ExpTrajOpt::optimize(const StatePVAJ &headPVAJ, const StatePVAJ &tailPVAJ,
                 break;
             }
             opt_vars.given_init_ts_and_ps = true;
-            opt_vars.init_ts = (base_init_ts * time_scale).cwiseMax(kMinStablePieceTime);
+            opt_vars.min_piece_times = (base_init_ts * time_scale).cwiseMax(kMinStablePieceTime);
+            opt_vars.init_ts = opt_vars.min_piece_times +
+                    (0.1 * opt_vars.min_piece_times).cwiseMax(kMinMappedPieceTime);
             opt_vars.init_ps = base_init_ps;
             opt_vars.penaltyWeights = base_penalty_weights;
             opt_vars.penaltyWeights(0) *= constraint_scale;
@@ -1316,6 +1324,7 @@ bool ExpTrajOpt::optimize(const StatePVAJ &headPVAJ, const StatePVAJ &tailPVAJ,
         opt_vars.penaltyWeights = base_penalty_weights;
         opt_vars.rho = base_rho;
         opt_vars.given_init_ts_and_ps = base_given_init;
+        opt_vars.min_piece_times.resize(0);
     }
     if (success && !std::isfinite(opt_cost)) {
         cout << YELLOW << " -- [SUPER] Minco exp_traj opt failed." << RESET << endl;
